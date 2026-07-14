@@ -11,6 +11,8 @@ requires-python = ">=3.10,<3.11"
 
 [project.scripts]
 snu-infer = "snuaichal.inference:main"
+snu-baseline-submit = "snuaichal.baseline:main"
+snu-train = "snuaichal.training:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

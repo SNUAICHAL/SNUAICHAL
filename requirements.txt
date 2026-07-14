@@ -2,8 +2,10 @@
 # Install the matching CUDA build of PyTorch first when necessary:
 #   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
 torch==2.5.1
+torchvision==0.20.1
 transformers==4.49.0
 accelerate==1.4.0
+peft==0.14.0
 qwen-vl-utils==0.0.10
 pandas==2.2.3
 Pillow==11.1.0

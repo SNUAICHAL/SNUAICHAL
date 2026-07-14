@@ -114,6 +114,15 @@ models/Qwen2-VL-2B-Instruct/
 
 이 베이스라인은 학습이나 파인튜닝을 하지 않습니다.
 
+Kaggle에서 팀 생성 권한을 얻기 위한 첫 제출은 모델 없이 즉시 만들 수 있습니다.
+
+```bash
+snu-baseline-submit --test-csv data/test.csv --output outputs/baseline_submission.csv
+```
+
+이 파일은 모든 샘플에 유효한 기본 순열 `[1, 2, 3, 4]`를 사용합니다. 성능 확인용
+모델 베이스라인이 아니라 제출 형식과 팀 생성 절차를 확인하기 위한 파일입니다.
+
 ```bash
 python scripts/train.py
 ```
