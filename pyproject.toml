@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snu-ai-challenge"
+version = "0.1.0"
+description = "Reproducible zero-shot baseline for the SNU AI Challenge"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+
+[project.scripts]
+snu-infer = "snuaichal.inference:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
