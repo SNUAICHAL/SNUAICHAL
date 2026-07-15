@@ -7,11 +7,35 @@ import ast
 import csv
 import itertools
 import random
+from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
 from snuaichal.inference import build_messages
 from snuaichal.submission import answer_to_string, chronological_to_positions, is_permutation
+
+
+def seed_training(seed: int) -> None:
+    """Seed Python, NumPy, and Torch before model and LoRA initialization."""
+    from transformers import set_seed
+
+    set_seed(seed)
+
+
+def image_dhash(image_path: Path) -> int:
+    """Return a 64-bit difference hash stable across ordinary JPEG recompression."""
+    from PIL import Image
+
+    with Image.open(image_path) as image:
+        grayscale = image.convert("L").resize((9, 8), Image.Resampling.LANCZOS)
+        pixels = list(grayscale.getdata())
+    fingerprint = 0
+    for y in range(8):
+        for x in range(8):
+            fingerprint = (fingerprint << 1) | (
+                pixels[y * 9 + x] > pixels[y * 9 + x + 1]
+            )
+    return fingerprint
 
 
 def split_rows(
@@ -50,6 +74,64 @@ def split_rows(
     random_generator.shuffle(validation_rows)
     if not validation_rows:
         validation_rows.append(train_rows.pop())
+    return train_rows, validation_rows
+
+
+def split_rows_without_image_overlap(
+    rows: list[Any], image_dir: Path, validation_fraction: float, seed: int
+) -> tuple[list[Any], list[Any]]:
+    """Build a stratified holdout whose image bytes occur in no other row."""
+    if not 0.0 < validation_fraction < 1.0:
+        raise ValueError("validation_fraction must be between 0 and 1")
+    if len(rows) < 2:
+        raise ValueError("At least two rows are required for a train/validation split")
+
+    row_hashes: list[list[int]] = []
+    hash_counts: Counter[int] = Counter()
+    for row in rows:
+        sample_hashes = []
+        for slot in range(1, 5):
+            image_path = image_dir / str(row["Id"]) / str(row[f"Input_{slot}"])
+            digest = image_dhash(image_path)
+            sample_hashes.append(digest)
+            hash_counts[digest] += 1
+        row_hashes.append(sample_hashes)
+
+    candidates = [
+        row
+        for row, sample_hashes in zip(rows, row_hashes)
+        if all(hash_counts[digest] == 1 for digest in sample_hashes)
+    ]
+    validation_size = max(1, round(len(rows) * validation_fraction))
+    if len(candidates) < validation_size:
+        raise ValueError(
+            f"Only {len(candidates)} image-disjoint rows are available for "
+            f"a {validation_size}-row validation split"
+        )
+
+    groups: dict[str, list[Any]] = {}
+    for row in candidates:
+        groups.setdefault(str(row["Answer"]), []).append(row)
+    random_generator = random.Random(seed)
+    quotas: dict[str, int] = {}
+    remainders: list[tuple[float, str]] = []
+    for label, group in groups.items():
+        ideal = validation_size * len(group) / len(candidates)
+        quotas[label] = int(ideal)
+        remainders.append((ideal - quotas[label], label))
+        random_generator.shuffle(group)
+    for _, label in sorted(remainders, reverse=True)[
+        : validation_size - sum(quotas.values())
+    ]:
+        quotas[label] += 1
+
+    validation_rows = [
+        row for label, group in groups.items() for row in group[: quotas[label]]
+    ]
+    validation_ids = {str(row["Id"]) for row in validation_rows}
+    train_rows = [row for row in rows if str(row["Id"]) not in validation_ids]
+    random_generator.shuffle(train_rows)
+    random_generator.shuffle(validation_rows)
     return train_rows, validation_rows
 
 
@@ -169,11 +251,15 @@ class Qwen2VLCollator:
 
         labels = batch.input_ids.clone()
         prompt_lengths = prompt_batch.attention_mask.sum(dim=1)
-        for row_index, prompt_length in enumerate(prompt_lengths.tolist()):
-            labels[row_index, :prompt_length] = -100
-        pad_token_id = self.processor.tokenizer.pad_token_id
-        if pad_token_id is not None:
-            labels = torch.where(labels == pad_token_id, -100, labels)
+        full_lengths = batch.attention_mask.sum(dim=1)
+        left_padding = getattr(self.processor.tokenizer, "padding_side", "right") == "left"
+        for row_index, (prompt_length, full_length) in enumerate(
+            zip(prompt_lengths.tolist(), full_lengths.tolist())
+        ):
+            non_padding_start = labels.shape[1] - full_length if left_padding else 0
+            answer_start = non_padding_start + prompt_length
+            labels[row_index, :answer_start] = -100
+        labels = torch.where(batch.attention_mask == 0, -100, labels)
         batch["labels"] = labels
         return dict(batch)
 
@@ -188,10 +274,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir", type=Path, default=Path("outputs/qwen2-vl-lora")
     )
     parser.add_argument("--epochs", type=float, default=1.0)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
-    parser.add_argument("--validation-fraction", type=float, default=0.05)
+    parser.add_argument("--validation-fraction", type=float, default=0.2)
     parser.add_argument("--max-pixels", type=int, default=256 * 28 * 28)
     parser.add_argument("--min-pixels", type=int, default=56 * 28 * 28)
     parser.add_argument("--lora-rank", type=int, default=16)
@@ -201,9 +287,50 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-steps", type=int, default=100)
     parser.add_argument("--logging-steps", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--balance-inputs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Permute training image slots to flatten the 24 target classes",
+    )
+    parser.add_argument(
+        "--clean-validation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Hold out only rows whose image bytes never occur in another row",
+    )
     parser.add_argument("--limit", type=int)
     parser.add_argument("--resume-from-checkpoint", type=Path)
     return parser
+
+
+def build_training_argument_kwargs(
+    args: argparse.Namespace, bf16: bool
+) -> dict[str, Any]:
+    """Build Trainer settings while reserving validation for exact-match inference."""
+    return {
+        "output_dir": str(args.output_dir),
+        "num_train_epochs": args.epochs,
+        "per_device_train_batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "learning_rate": args.learning_rate,
+        "warmup_ratio": 0.03,
+        "weight_decay": 0.01,
+        "logging_steps": args.logging_steps,
+        "eval_strategy": "no",
+        "save_strategy": "steps",
+        "save_steps": args.save_steps,
+        "save_total_limit": None,
+        "bf16": bf16,
+        "fp16": not bf16,
+        "gradient_checkpointing": True,
+        "remove_unused_columns": False,
+        "dataloader_num_workers": 0,
+        "report_to": "none",
+        "max_steps": args.max_steps,
+        "seed": args.seed,
+        "data_seed": args.seed,
+    }
 
 
 def run(args: argparse.Namespace) -> None:
@@ -215,6 +342,8 @@ def run(args: argparse.Namespace) -> None:
         Trainer,
         TrainingArguments,
     )
+
+    seed_training(args.seed)
 
     train_csv = args.data_dir / "train.csv"
     image_dir = args.data_dir / "train"
@@ -243,12 +372,25 @@ def run(args: argparse.Namespace) -> None:
     missing_columns = required_columns.difference(rows[0])
     if missing_columns:
         raise ValueError(f"Missing train.csv columns: {sorted(missing_columns)}")
+    if args.clean_validation:
+        train_rows, validation_rows = split_rows_without_image_overlap(
+            rows,
+            image_dir=image_dir,
+            validation_fraction=args.validation_fraction,
+            seed=args.seed,
+        )
+    else:
+        train_rows, validation_rows = split_rows(
+            rows, validation_fraction=args.validation_fraction, seed=args.seed
+        )
     if args.limit is not None:
-        rows = rows[: args.limit]
-    train_rows, validation_rows = split_rows(
-        rows, validation_fraction=args.validation_fraction, seed=args.seed
-    )
-    train_rows = balance_training_rows(train_rows, seed=args.seed)
+        if args.limit < 2:
+            raise ValueError("limit must be at least 2")
+        limited_validation_size = max(1, round(args.limit * args.validation_fraction))
+        validation_rows = validation_rows[:limited_validation_size]
+        train_rows = train_rows[: args.limit - limited_validation_size]
+    if args.balance_inputs:
+        train_rows = balance_training_rows(train_rows, seed=args.seed)
 
     bf16 = torch.cuda.is_bf16_supported()
     dtype = torch.bfloat16 if bf16 else torch.float16
@@ -287,36 +429,11 @@ def run(args: argparse.Namespace) -> None:
     )
     model.print_trainable_parameters()
 
-    training_args = TrainingArguments(
-        output_dir=str(args.output_dir),
-        num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=1,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        learning_rate=args.learning_rate,
-        warmup_ratio=0.03,
-        weight_decay=0.01,
-        logging_steps=args.logging_steps,
-        eval_strategy="steps",
-        eval_steps=args.save_steps,
-        save_strategy="steps",
-        save_steps=args.save_steps,
-        save_total_limit=2,
-        bf16=bf16,
-        fp16=not bf16,
-        gradient_checkpointing=True,
-        remove_unused_columns=False,
-        dataloader_num_workers=0,
-        report_to="none",
-        max_steps=args.max_steps,
-        seed=args.seed,
-        data_seed=args.seed,
-    )
+    training_args = TrainingArguments(**build_training_argument_kwargs(args, bf16))
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_rows,
-        eval_dataset=validation_rows,
         data_collator=Qwen2VLCollator(processor, image_dir),
     )
     trainer.train(

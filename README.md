@@ -67,10 +67,12 @@
 ├── models/                        # 로컬 모델 가중치(커밋 금지)
 ├── notebooks/                     # 운영진 제공 원본 베이스라인
 ├── outputs/                       # 제출 파일과 원시 출력(커밋 금지)
-├── scripts/train.py               # zero-shot이라 학습 없음 명시
+├── scripts/train.py               # Qwen2-VL LoRA 학습 진입점
 ├── src/snuaichal/
-│   ├── inference.py              # 독립 실행 가능한 추론 코드
-│   └── submission.py             # 출력 파싱·순서 변환·검증
+│   ├── evaluation.py             # exact-match 및 실패율 측정
+│   ├── inference.py              # base/LoRA 검증 및 제출 추론
+│   ├── submission.py             # 출력 파싱·순서 변환·검증
+│   └── training.py               # 층화 split·순열 증강·LoRA 학습
 └── tests/                         # 제출 형식 단위 테스트
 ```
 
@@ -112,8 +114,6 @@ models/Qwen2-VL-2B-Instruct/
 
 ## 실행
 
-이 베이스라인은 학습이나 파인튜닝을 하지 않습니다.
-
 Kaggle에서 팀 생성 권한을 얻기 위한 첫 제출은 모델 없이 즉시 만들 수 있습니다.
 
 ```bash
@@ -123,8 +123,35 @@ snu-baseline-submit --test-csv data/test.csv --output outputs/baseline_submissio
 이 파일은 모든 샘플에 유효한 기본 순열 `[1, 2, 3, 4]`를 사용합니다. 성능 확인용
 모델 베이스라인이 아니라 제출 형식과 팀 생성 절차를 확인하기 위한 파일입니다.
 
+경쟁용 학습은 이미지 SHA-256이 train에 재등장하지 않는 20% clean validation을
+층화 추출한 뒤, 학습 입력 슬롯을 재배열해 24개 순열 라벨을 균형화합니다. 기본값은
+RTX 3090에서 검증한 micro batch 2, gradient accumulation 4, LoRA rank 16입니다.
+
 ```bash
-python scripts/train.py
+snu-train --output-dir outputs/qwen2-vl-lora
+```
+
+학습 중 teacher-forcing validation loss는 대회 exact match와 맞지 않아 계산하지
+않습니다. `checkpoint-*` 어댑터를 모두 보존하므로 아래 평가 명령의
+`--adapter-path`를 각 checkpoint로 바꿔 exact match가 가장 높은 하나를 선택합니다.
+
+학습 전 짧은 smoke test는 다음처럼 실행합니다.
+
+```bash
+snu-train --limit 48 --max-steps 3 --gradient-accumulation-steps 1 \
+  --save-steps 3 --output-dir outputs/strategy-smoke
+```
+
+저장된 LoRA를 동일한 추론 코드로 held-out validation에 평가합니다.
+
+```bash
+snu-infer \
+  --test-csv data/train.csv \
+  --image-dir data/train \
+  --adapter-path outputs/qwen2-vl-lora/final \
+  --validation-fraction 0.2 \
+  --output outputs/validation_predictions.csv \
+  --metrics-output outputs/validation_metrics.json
 ```
 
 먼저 소수 샘플로 입출력과 VRAM 사용량을 확인합니다.
@@ -139,6 +166,7 @@ snu-infer --limit 5
 snu-infer \
   --data-dir data \
   --model-path models/Qwen2-VL-2B-Instruct \
+  --adapter-path outputs/qwen2-vl-lora/final \
   --output outputs/submission.csv \
   --audit-log outputs/raw_predictions.jsonl
 ```
@@ -146,10 +174,11 @@ snu-infer \
 모델 로딩은 기본적으로 네트워크를 차단합니다. `--allow-network`는 개발 중 명시적으로
 필요한 경우에만 사용하고, 최종 제출 전에는 반드시 옵션 없이 오프라인 재현을 확인하세요.
 
-생성물은 다음 두 파일입니다.
+생성물은 다음 파일입니다.
 
 - `outputs/submission.csv`: `Id,Answer` 형식의 제출 파일
 - `outputs/raw_predictions.jsonl`: 원시 모델 출력, 파싱 성공 여부, 최종 답변 감사 로그
+- `outputs/validation_metrics.json`: exact match, identity/non-identity 정확도, 파싱 실패율
 
 모델이 올바른 순열을 출력하지 못하면 베이스라인과 동일하게 `[1, 2, 3, 4]`를
 사용하되 실패 건수를 마지막에 표시하고 감사 로그에 `parse_ok=false`로 남깁니다.

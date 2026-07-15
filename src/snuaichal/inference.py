@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import random
 from pathlib import Path
@@ -78,11 +79,30 @@ def run(args: argparse.Namespace) -> None:
         raise FileNotFoundError(
             f"Local model not found: {args.model_path}. See models/README.md."
         )
+    if args.adapter_path is not None and not args.adapter_path.is_dir():
+        raise FileNotFoundError(f"Local LoRA adapter not found: {args.adapter_path}")
 
     test_df = pd.read_csv(test_csv, dtype={"Id": str})
     missing_columns = REQUIRED_COLUMNS.difference(test_df.columns)
     if missing_columns:
         raise ValueError(f"Missing test.csv columns: {sorted(missing_columns)}")
+    if args.validation_fraction is not None:
+        if "Answer" not in test_df.columns:
+            raise ValueError("Validation evaluation requires an Answer column")
+        from snuaichal.training import split_rows, split_rows_without_image_overlap
+
+        split_function = (
+            split_rows_without_image_overlap if args.clean_validation else split_rows
+        )
+        split_kwargs = {
+            "rows": test_df.to_dict("records"),
+            "validation_fraction": args.validation_fraction,
+            "seed": args.seed,
+        }
+        if args.clean_validation:
+            split_kwargs["image_dir"] = image_dir
+        _, validation_rows = split_function(**split_kwargs)
+        test_df = pd.DataFrame(validation_rows)
     if args.limit is not None:
         test_df = test_df.head(args.limit)
 
@@ -93,14 +113,26 @@ def run(args: argparse.Namespace) -> None:
         device_map=args.device_map,
         local_files_only=not args.allow_network,
     )
+    if args.adapter_path is not None:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(
+            model,
+            args.adapter_path,
+            local_files_only=not args.allow_network,
+        )
     processor = AutoProcessor.from_pretrained(
         args.model_path,
+        min_pixels=args.min_pixels,
+        max_pixels=args.max_pixels,
         local_files_only=not args.allow_network,
     )
     model.eval()
 
     predictions: list[dict[str, str]] = []
     audit_rows: list[dict[str, Any]] = []
+    metric_predictions: list[list[int] | None] = []
+    metric_references: list[list[int]] = []
     parse_failures = 0
 
     for _, row in tqdm(test_df.iterrows(), total=len(test_df), desc="Inference"):
@@ -134,6 +166,10 @@ def run(args: argparse.Namespace) -> None:
         )[0]
 
         parsed_answer = parse_model_output(output_text)
+        if args.validation_fraction is not None:
+            reference = ast.literal_eval(str(row["Answer"]))
+            metric_predictions.append(parsed_answer)
+            metric_references.append(reference)
         parse_ok = parsed_answer is not None
         if not parse_ok:
             parse_failures += 1
@@ -163,6 +199,15 @@ def run(args: argparse.Namespace) -> None:
 
     print(f"Saved {len(predictions)} predictions to {args.output}")
     print(f"Parse failures: {parse_failures}/{len(predictions)}")
+    if metric_references:
+        from snuaichal.evaluation import compute_exact_match_metrics
+
+        metrics = compute_exact_match_metrics(metric_predictions, metric_references)
+        args.metrics_output.parent.mkdir(parents=True, exist_ok=True)
+        args.metrics_output.write_text(
+            json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        print(json.dumps(metrics, sort_keys=True))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -173,11 +218,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model-path", type=Path, default=Path("models/Qwen2-VL-2B-Instruct")
     )
+    parser.add_argument("--adapter-path", type=Path)
+    parser.add_argument(
+        "--validation-fraction",
+        type=float,
+        help="Evaluate the deterministic held-out fraction of a labeled CSV",
+    )
+    parser.add_argument(
+        "--clean-validation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Match the image-disjoint training holdout",
+    )
+    parser.add_argument(
+        "--metrics-output", type=Path, default=Path("outputs/validation_metrics.json")
+    )
     parser.add_argument("--output", type=Path, default=Path("outputs/submission.csv"))
     parser.add_argument(
         "--audit-log", type=Path, default=Path("outputs/raw_predictions.jsonl")
     )
-    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--min-pixels", type=int, default=56 * 28 * 28)
+    parser.add_argument("--max-pixels", type=int, default=256 * 28 * 28)
+    parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument(
         "--dtype",
         choices=("auto", "float16", "bfloat16", "float32"),
