@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import pytest
-import torch
 
 from snuaichal.training import (
     Qwen2VLCollator,
@@ -15,6 +14,7 @@ from snuaichal.training import (
     seed_training,
     split_rows,
     split_rows_without_image_overlap,
+    write_or_validate_manifest,
 )
 
 
@@ -52,6 +52,8 @@ def test_training_messages_end_with_chronological_assistant_answer(
 
 
 def test_collator_masks_prompt_and_padding_tokens(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+
     class FakeBatch(dict):
         def __getattr__(self, name: str):
             return self[name]
@@ -99,6 +101,8 @@ def test_collator_masks_prompt_and_padding_tokens(tmp_path: Path) -> None:
 
 
 def test_collator_masks_left_padded_batch_prompts(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+
     class FakeBatch(dict):
         def __getattr__(self, name: str):
             return self[name]
@@ -179,22 +183,26 @@ def test_split_rows_is_deterministic_and_disjoint() -> None:
 def test_training_defaults_fit_a_single_24gb_gpu() -> None:
     args = build_parser().parse_args([])
 
-    assert args.batch_size == 2
-    assert args.gradient_accumulation_steps == 4
-    assert args.max_pixels == 200704
-    assert args.lora_rank == 16
+    assert args.batch_size == 1
+    assert args.gradient_accumulation_steps == 8
+    assert args.image_size == 512
+    assert args.max_pixels is None
+    assert args.lora_rank is None
     assert args.balance_inputs is True
     assert args.clean_validation is True
-    assert args.validation_fraction == 0.2
+    assert args.validation_fraction == 0.1
 
     training_kwargs = build_training_argument_kwargs(args, bf16=True)
     assert training_kwargs["eval_strategy"] == "no"
     assert training_kwargs["save_total_limit"] is None
+    assert training_kwargs["lr_scheduler_type"] == "cosine"
+    assert training_kwargs["max_steps"] == -1
 
 
 def test_training_seed_reproduces_torch_and_python_randomness() -> None:
     import random
 
+    torch = pytest.importorskip("torch")
     seed_training(17)
     first = (random.random(), torch.rand(3).tolist())
     seed_training(17)
@@ -320,3 +328,12 @@ def test_split_rows_is_label_stratified() -> None:
     assert sum(row["Answer"] == "[1, 2, 3, 4]" for row in validation_rows) == 2
     assert sum(row["Answer"] == "[4, 3, 2, 1]" for row in validation_rows) == 2
     assert len(train_rows) == 16
+
+
+def test_run_manifest_rejects_incompatible_resume_settings(tmp_path: Path) -> None:
+    path = tmp_path / "schedule.json"
+    write_or_validate_manifest(path, {"scheduler_horizon_steps": 6438})
+    write_or_validate_manifest(path, {"scheduler_horizon_steps": 6438})
+
+    with pytest.raises(ValueError, match="does not match"):
+        write_or_validate_manifest(path, {"scheduler_horizon_steps": 4292})

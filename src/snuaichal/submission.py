@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 FRAME_COUNT = 4
 IDENTITY_ORDER = [1, 2, 3, 4]
@@ -34,20 +35,31 @@ def chronological_to_positions(order: Sequence[int]) -> list[int]:
     return positions
 
 
-def parse_model_output(output_text: str) -> list[int] | None:
-    """Parse the last valid permutation and convert it to submission format.
-
-    Returning ``None`` lets the caller count parse failures explicitly instead of
-    silently treating them as confident identity-order predictions.
-    """
+def find_last_valid_permutation_substring(
+    output_text: str,
+) -> tuple[str, int, int] | None:
+    """Return the text and character span of the last valid bracketed answer."""
     for match in reversed(list(_LIST_PATTERN.finditer(output_text))):
         try:
             candidate = ast.literal_eval(match.group(0))
         except (SyntaxError, ValueError):
             continue
         if is_permutation(candidate):
-            return chronological_to_positions(candidate)
+            return match.group(0), match.start(), match.end()
     return None
+
+
+def parse_model_output(output_text: str) -> list[int] | None:
+    """Parse the final bracketed list and convert it to submission format.
+
+    Returning ``None`` lets the caller count parse failures explicitly instead of
+    silently treating them as confident identity-order predictions.
+    """
+    located = find_last_valid_permutation_substring(output_text)
+    if located is None:
+        return None
+    candidate = ast.literal_eval(located[0])
+    return chronological_to_positions(candidate)
 
 
 def answer_to_string(answer: Sequence[int]) -> str:
@@ -55,3 +67,31 @@ def answer_to_string(answer: Sequence[int]) -> str:
     if not is_permutation(answer):
         raise ValueError(f"Invalid submission answer: {answer!r}")
     return str(list(answer))
+
+
+def validate_submission_records(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    expected_ids: Sequence[str],
+    expected_count: int | None = None,
+) -> None:
+    """Validate final row count, ID order, uniqueness, and permutation answers."""
+    if expected_count is not None and len(records) != expected_count:
+        raise ValueError(f"Expected {expected_count} rows, got {len(records)}")
+    ids = [str(record.get("Id")) for record in records]
+    if ids != [str(sample_id) for sample_id in expected_ids]:
+        raise ValueError("Submission IDs or row order do not match the input CSV")
+    if len(set(ids)) != len(ids):
+        raise ValueError("Submission IDs must be unique")
+    for record in records:
+        raw_answer = record.get("Answer")
+        try:
+            answer = ast.literal_eval(str(raw_answer))
+        except (SyntaxError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid Answer for Id={record.get('Id')}: {raw_answer!r}"
+            ) from exc
+        if not is_permutation(answer):
+            raise ValueError(
+                f"Invalid Answer for Id={record.get('Id')}: {raw_answer!r}"
+            )

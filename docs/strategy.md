@@ -1,6 +1,6 @@
 # Competition strategy
 
-Last updated: 2026-07-14
+Last updated: 2026-07-15
 
 ## Objective
 
@@ -20,37 +20,42 @@ The identity public score closely matches its training prior. Input order theref
 
 ## Primary approach
 
-1. Use a deterministic label-stratified 20% holdout containing only rows whose exact image bytes never occur in another row; never augment validation rows.
-2. Randomly permute the four input-image slots in each training row and transform the target accordingly. This preserves the task while flattening the accidental identity-label prior.
-3. Fine-tune Qwen2-VL-2B-Instruct with LoRA on the chronological image-label answer.
-4. Evaluate generated answers with the competition's exact-match metric and record parse-failure rate in addition to loss.
-5. Load the selected LoRA adapter during test inference; never evaluate only the untouched base model.
-6. Guarantee a valid submission permutation by parsing model output and using the measured identity prior only as a parse-failure fallback.
+The reproduction target is the public 0.91972 result with one
+`Qwen/Qwen3-VL-8B-Instruct` checkpoint. Qwen3.5-27B is a secondary dense challenger,
+not an ensemble member.
+
+1. Split a deterministic, label-stratified, image-disjoint 10% holdout before any augmentation and save all split IDs.
+2. At each training epoch, deterministically shuffle each row's four input slots from `SHA-256(seed, epoch, Id)` and transform the answer. Never augment validation.
+3. Load the 8B model with bitsandbytes NF4 double quantization and BF16 compute. Freeze the vision tower and apply LoRA to language attention/MLP projections.
+4. Train with micro batch 1, accumulation 8, and a six-epoch cosine scheduler horizon. Stop and save after four epochs at global step 4292; do not shorten the scheduler with `max_steps`.
+5. Evaluate every epoch checkpoint by generated exact match, parse failure, 24-way confusion, speed, peak VRAM, and cyclic 4-TTA consistency.
+6. For TTA, canonicalize every permuted-view prediction back to original input-slot coordinates before voting. Use identity only when all four parses fail.
+7. Run Qwen3.5-27B only after an 8B two-step smoke and pipeline validation. Keep one final model/checkpoint.
 
 ## Experiment order
 
 | Stage | Change | Gate |
 |---|---|---|
-| A | Base Qwen2-VL zero-shot clean validation | Establish exact-match and parse-failure baseline |
-| B | LoRA, stratified split, no augmentation | Must improve validation exact match over A |
-| C | One random slot permutation per training row | Keep only if it improves exact match, especially non-identity labels |
-| D | Compare a 24-way permutation classifier or 24-candidate scoring | Prefer it if exact match is at least tied with free generation |
-| E | Tune image resolution and LoRA rank within 24 GB | Keep best single checkpoint; no fold/model ensemble |
+| A | Qwen3-VL-8B NF4 two-step smoke at 512² | No OOM; record visual tokens, trainable parameters, loss, LR, peak VRAM |
+| B | 8B LoRA, 10% clean split, no augmentation | Establish generated exact-match baseline |
+| C | Deterministic epoch-aware slot augmentation | Improve non-identity and overall exact match |
+| D | Evaluate checkpoints 1073/2146/3219/4292 with cyclic 4-TTA | Select by exact match, then failures/speed; no ensemble |
+| E | Qwen3.5-27B rank-8 NF4 smoke and one challenger run | Keep only if 24 GB feasible and validation improves |
 | F | Full test inference and Kaggle submission | Validate 819 rows, zero invalid answers, runtime under 24 hours |
 
-## Initial training configuration
+## Reproduction training configuration
 
-- Model: `Qwen/Qwen2-VL-2B-Instruct`
-- Precision: BF16 when supported, otherwise FP16
-- LoRA: rank 16, alpha 32, dropout 0.05
-- Targets: language attention and MLP projections
-- Image budget: 56 to 256 visual patches (`43,904` to `200,704` pixels)
-- Micro batch: 2 after successful local smoke test
-- Gradient accumulation: 4 (effective batch 8)
-- Epochs: 1 initially
-- Learning rate: 2e-4 with 3% warmup
-- Validation: deterministic, label-stratified 20% clean holdout (1,907 rows, zero exact-image overlap)
-- Selection metric: validation exact-match accuracy, then parse-failure rate
+- Model: `Qwen/Qwen3-VL-8B-Instruct`, revision `0c351dd01ed87e9c1b53cbc748cba10e6187ff3b`
+- Quantization: bitsandbytes NF4, double quantization, BF16 compute
+- LoRA: rank 16, alpha 32, dropout 0.05; language projections only; frozen vision tower
+- Image budget: 512×512 area (`262,144` pixels), while preserving aspect ratio
+- Micro batch: 1; gradient accumulation: 8 (effective batch 8)
+- Learning rate: 2e-4, 3% warmup, cosine horizon 6438 updates
+- Stop: callback at global step 4292; checkpoints every 1073 updates
+- Validation: deterministic label-stratified 10% clean holdout, never augmented
+- Generation: thinking disabled for Qwen3.5, strict final-answer parsing, max 16 new tokens
+- Selection metric: validation exact match, then parse-failure/TTA consistency/speed
+- Challenger: `Qwen/Qwen3.5-27B`, revision `fc05daec18b0a78c049392ed2e771dde82bdf654`, default LoRA rank 8
 
 ## Risks and controls
 
