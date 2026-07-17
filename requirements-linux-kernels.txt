@@ -1,0 +1,4 @@
+# Optional Qwen3.5 Gated DeltaNet acceleration for Linux/WSL2 only.
+# Install only after the pinned base environment is working.
+causal-conv1d
+flash-linear-attention[cuda]

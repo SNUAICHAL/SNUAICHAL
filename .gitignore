@@ -15,6 +15,7 @@ venv/
 Thumbs.db
 
 # Competition data, model weights, and generated artifacts
+/snuaichallenge.zip
 data/*
 !data/README.md
 models/*

@@ -67,10 +67,12 @@
 ├── models/                        # 로컬 모델 가중치(커밋 금지)
 ├── notebooks/                     # 운영진 제공 원본 베이스라인
 ├── outputs/                       # 제출 파일과 원시 출력(커밋 금지)
-├── scripts/train.py               # zero-shot이라 학습 없음 명시
+├── scripts/train.py               # Qwen2-VL LoRA 학습 진입점
 ├── src/snuaichal/
-│   ├── inference.py              # 독립 실행 가능한 추론 코드
-│   └── submission.py             # 출력 파싱·순서 변환·검증
+│   ├── evaluation.py             # exact-match 및 실패율 측정
+│   ├── inference.py              # base/LoRA 검증 및 제출 추론
+│   ├── submission.py             # 출력 파싱·순서 변환·검증
+│   └── training.py               # 층화 split·순열 증강·LoRA 학습
 └── tests/                         # 제출 형식 단위 테스트
 ```
 
@@ -112,45 +114,160 @@ models/Qwen2-VL-2B-Instruct/
 
 ## 실행
 
-이 베이스라인은 학습이나 파인튜닝을 하지 않습니다.
+Kaggle에서 팀 생성 권한을 얻기 위한 첫 제출은 모델 없이 즉시 만들 수 있습니다.
 
 ```bash
-python scripts/train.py
+snu-baseline-submit --test-csv data/test.csv --output outputs/baseline_submission.csv
 ```
 
-먼저 소수 샘플로 입출력과 VRAM 사용량을 확인합니다.
+이 파일은 모든 샘플에 유효한 기본 순열 `[1, 2, 3, 4]`를 사용합니다. 성능 확인용
+모델 베이스라인이 아니라 제출 형식과 팀 생성 절차를 확인하기 위한 파일입니다.
+
+### 재현 대상 모델
+
+| 모델 | local path | 공식 revision | 최초 공개 | 라이선스 | snapshot 크기 |
+|---|---|---|---|---|---|
+| Qwen3-VL-8B-Instruct | `models/Qwen3-VL-8B-Instruct` | `0c351dd01ed87e9c1b53cbc748cba10e6187ff3b` | 2025-10-11 | Apache-2.0 | 약 17.55 GB |
+| Qwen3.5-27B | `models/Qwen3.5-27B` | `fc05daec18b0a78c049392ed2e771dde82bdf654` | 2026-02-24 | Apache-2.0 | 약 55.58 GB |
+
+둘 다 2026-05-31 cutoff 이전 공개 가중치입니다. `Qwen3.5-27B`는 dense
+`Qwen3_5ForConditionalGeneration` 모델입니다. 모델 파일이 없을 때 학습 코드가
+자동 다운로드하지 않습니다. 정확한 다운로드 명령은 [models/README.md](models/README.md)에
+기록되어 있습니다.
+
+### Qwen3-VL-8B 0.91972 레시피
+
+split은 augmentation보다 먼저 수행합니다. 9,535행의 10% validation은 약 954행,
+train은 약 8,581행입니다. effective batch 8일 때 `ceil(8581/8)=1073`
+update/epoch이므로 4 epoch 종료점은 4,292입니다. cosine scheduler는 6 epoch,
+즉 6,438 step horizon을 유지합니다. `max_steps=4292`를 사용하지 않으며 callback이
+4,292에서 저장 후 종료합니다.
+
+2-step VRAM smoke:
 
 ```bash
-snu-infer --limit 5
+snu-train \
+  --model-path models/Qwen3-VL-8B-Instruct \
+  --load-in-4bit \
+  --validation-fraction 0.10 \
+  --image-size 512 \
+  --epochs 6 \
+  --stop-after-steps 2 \
+  --batch-size 1 \
+  --gradient-accumulation-steps 8 \
+  --output-dir outputs/qwen3-vl-8b-smoke
 ```
 
-전체 테스트 추론은 다음과 같습니다.
+전체 학습은 smoke의 peak VRAM, loss, visual token 수를 확인한 뒤에만 실행합니다.
+
+```bash
+snu-train \
+  --model-path models/Qwen3-VL-8B-Instruct \
+  --load-in-4bit \
+  --validation-fraction 0.10 \
+  --image-size 512 \
+  --epochs 6 \
+  --stop-after-steps 4292 \
+  --save-steps 1073 \
+  --batch-size 1 \
+  --gradient-accumulation-steps 8 \
+  --output-dir outputs/qwen3-vl-8b-aug
+```
+
+학습 입력은 매 epoch마다 `SHA-256(seed, epoch, Id)`로 결정된 permutation을
+on-the-fly 적용합니다. validation은 원본 순서를 유지합니다. split Id는
+`split_manifest.json`, scheduler 계획은 `schedule.json`, LoRA target과 trainable
+parameter는 `model_manifest.json`에 저장됩니다. resume 시 scheduler/global step은
+Trainer checkpoint에서 복구되며 4,292 이상 checkpoint의 재개는 거부됩니다.
+
+### Validation과 cyclic 4-TTA
+
+4-TTA 입력 순서는 `[1,2,3,4]`, `[2,3,4,1]`, `[3,4,1,2]`, `[4,1,2,3]`입니다.
+각 view를 순차 실행하고 prediction을 원본 slot 좌표로 역변환한 뒤 canonical Answer에서
+다수결합니다. 동률은 lexicographic minimum으로 결정합니다. 모든 view 파싱 실패일 때만
+identity `[1,2,3,4]`를 사용합니다.
+
+```bash
+snu-infer \
+  --test-csv data/train.csv \
+  --image-dir data/train \
+  --model-path models/Qwen3-VL-8B-Instruct \
+  --adapter-path outputs/qwen3-vl-8b-aug/checkpoint-4292 \
+  --load-in-4bit --image-size 512 --tta 4 \
+  --validation-fraction 0.10 \
+  --output outputs/validation_predictions.csv \
+  --metrics-output outputs/validation_metrics.json
+```
+
+최종 제출:
 
 ```bash
 snu-infer \
   --data-dir data \
-  --model-path models/Qwen2-VL-2B-Instruct \
-  --output outputs/submission.csv \
-  --audit-log outputs/raw_predictions.jsonl
+  --model-path models/Qwen3-VL-8B-Instruct \
+  --adapter-path outputs/qwen3-vl-8b-aug/checkpoint-4292 \
+  --load-in-4bit --image-size 512 --tta 4 \
+  --output outputs/submission_v5_8b_aug_checkpoint-4292_tta4.csv \
+  --audit-log outputs/submission_v5_8b_aug_checkpoint-4292_tta4.jsonl
 ```
 
-모델 로딩은 기본적으로 네트워크를 차단합니다. `--allow-network`는 개발 중 명시적으로
-필요한 경우에만 사용하고, 최종 제출 전에는 반드시 옵션 없이 오프라인 재현을 확인하세요.
+### Public 리더보드 감시
 
-생성물은 다음 두 파일입니다.
+Kaggle public 리더보드의 신규 팀, 점수·순위 및 TOP7/10/16 컷 변동을 터미널에서
+감시할 수 있습니다. 표 상단에는 공식 예선 기간(`2026-06-29 10:00`부터
+`2026-07-24 23:59 KST`)의 진행률과 실시간 마감 카운트다운이 표시됩니다. 기본 우리
+팀명은 `밥먹을돈으로3090사서거지됨`이며 `--team` 또는 `SNUAICHAL_TEAM` 환경변수로
+바꿀 수 있습니다.
 
-- `outputs/submission.csv`: `Id,Answer` 형식의 제출 파일
-- `outputs/raw_predictions.jsonl`: 원시 모델 출력, 파싱 성공 여부, 최종 답변 감사 로그
+```powershell
+# 한 번 조회해 인증과 팀명을 확인
+snu-leaderboard-watch --once
 
-모델이 올바른 순열을 출력하지 못하면 베이스라인과 동일하게 `[1, 2, 3, 4]`를
-사용하되 실패 건수를 마지막에 표시하고 감사 로그에 `parse_ok=false`로 남깁니다.
+# 기본 30초 간격으로 감시하고 변동 시 터미널 벨 출력
+snu-leaderboard-watch --bell
+
+# 10초 간격, 매번 표 출력
+snu-leaderboard-watch --interval 10 --table
+```
+
+인증은 `~/.kaggle/kaggle.json`의 `username`/`key`, 환경변수
+`KAGGLE_USERNAME`+`KAGGLE_KEY`, 또는 `KAGGLE_API_TOKEN` 중 하나를 사용합니다.
+인증값은 출력이나 상태 파일에 기록하지 않습니다. 마지막 정상 스냅샷과 변동 이력은
+각각 `outputs/leaderboard_watch/state.json`, `events.jsonl`에 저장되어 프로세스를
+재시작해도 중간 변동을 확인할 수 있습니다. 상태를 무시하려면 `--fresh`, 파일을 전혀
+남기지 않으려면 `--no-state`를 사용합니다. 원본 호환 진입점
+`python tools/leaderboard_watch.py`도 제공됩니다.
+
+운영진이 일정을 변경하면 ISO 형식의 `--start`, `--deadline`으로 덮어쓸 수 있습니다.
+
+```powershell
+snu-leaderboard-watch `
+  --start 2026-06-29T10:00+09:00 `
+  --deadline 2026-07-24T23:59+09:00
+```
+
+Qwen3.5-27B challenger는 같은 명령에서 `--model-path models/Qwen3.5-27B`와
+`--output-dir`만 바꿉니다. 기본 LoRA rank는 8입니다. native Windows에서는 pure
+PyTorch fallback을 사용하며, Linux/WSL2 fast kernel은
+`requirements-linux-kernels.txt`의 선택 의존성을 사용합니다. 27B는 먼저 2-step
+VRAM smoke만 수행하고 8B pipeline 검증 전에는 장시간 학습하지 않습니다.
+
+모델/processor 로딩은 기본 `local_files_only=True`입니다. 완전 오프라인 검증은
+`HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`을 설정해 실행합니다. VRAM은 학습의
+`training_summary.json`과 validation의 `peak_vram_mib`로 확인하며 필요하면 별도로
+`nvidia-smi --query-compute-apps=used_memory --format=csv`를 기록합니다.
+
+validation metric에는 Exact Match, identity/non-identity accuracy, parse failure,
+TTA consistency, seconds/sample, peak VRAM, 24×24 permutation confusion이 포함됩니다.
+audit JSONL에는 TTA별 raw prediction과 canonical prediction이 기록됩니다. 최종 CSV는
+Id 순서·행 수·모든 Answer의 1~4 순열 여부를 저장 전에 검증합니다.
 
 ## 테스트
 
 ```bash
 pip install -r requirements-dev.txt
 pip install -e .
-ruff check src tests scripts
+ruff check src tests scripts tools
 pytest
 ```
 
