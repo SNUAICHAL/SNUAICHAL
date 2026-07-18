@@ -91,6 +91,66 @@ def test_official_inference_command_is_fixed_to_safe_second_submission(
     assert command[command.index("--output") + 1].endswith(
         queue.OFFICIAL_SUBMISSION_NAME
     )
+    for flag in (
+        "--model-path",
+        "--model-repository",
+        "--model-family",
+        "--model-revision",
+        "--model-manifest",
+        "--adapter-path",
+        "--precision",
+        "--tta",
+        "--aggregation-mode",
+        "--fallback-policy",
+        "--metrics-output",
+    ):
+        assert flag in command
+
+
+def test_followup_commands_have_complete_model_identity() -> None:
+    inference = queue.inference_command(step=4292, precision="nf4", tta=4)
+    training = queue.qwen35_training_command(
+        queue.ROOT / "outputs" / "qwen3-5-27b-smoke-2step"
+    )
+    for command in (inference, training):
+        for flag in (
+            "--model-path",
+            "--model-repository",
+            "--model-family",
+            "--model-revision",
+            "--model-manifest",
+        ):
+            assert flag in command
+
+
+def test_run_queue_never_performs_automatic_official_submission(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(queue, "wait_for_sweep", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        queue,
+        "read_sweep_results",
+        lambda: [queue.SweepResult("checkpoint-4292", 4292, 800, 0.84, 0, 1.0)],
+    )
+    monkeypatch.setattr(queue, "atomic_json", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(queue, "update_queue_status", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        queue,
+        "run_inference_stage",
+        lambda *_args, **_kwargs: {"exact_match": 0.84, "exact_matches": 800},
+    )
+    monkeypatch.setattr(queue, "run_qwen35_smoke", lambda **_kwargs: {"ok": True})
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("automatic official inference/submission is forbidden")
+
+    monkeypatch.setattr(queue, "run_official_inference_stage", forbidden)
+    monkeypatch.setattr(queue, "submit_official_attempt", forbidden)
+
+    result = queue.run_queue(runner_pid=None, poll_seconds=0.01)
+
+    assert result["coherent"] is True
+    assert result["official_submission"] is None
 
 
 def test_find_remote_submission_requires_file_and_description() -> None:

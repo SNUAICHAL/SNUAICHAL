@@ -10,8 +10,28 @@ from snuaichal.inference import build_parser
 def test_inference_accepts_a_local_lora_adapter() -> None:
     args = build_parser().parse_args(
         [
+            "--model-path",
+            "models/Qwen3-VL-8B-Instruct",
+            "--model-repository",
+            "Qwen/Qwen3-VL-8B-Instruct",
+            "--model-family",
+            "qwen3_vl",
+            "--model-revision",
+            "revision-1",
+            "--model-manifest",
+            "outputs/model-manifest.json",
             "--adapter-path",
             "outputs/run/final",
+            "--precision",
+            "nf4",
+            "--tta",
+            "1",
+            "--tta-orders-json",
+            "[[1,2,3,4]]",
+            "--aggregation-mode",
+            "hard",
+            "--fallback-policy",
+            "identity",
             "--validation-fraction",
             "0.05",
             "--metrics-output",
@@ -28,13 +48,34 @@ def test_inference_accepts_a_local_lora_adapter() -> None:
     assert args.image_size == 512
     assert args.max_pixels is None
     assert args.tta == 1
+    assert args.tta_orders == ((1, 2, 3, 4),)
+    assert args.fallback_policy == "identity"
 
 
 def test_inference_accepts_explicit_precision_and_manifest() -> None:
     args = build_parser().parse_args(
         [
+            "--model-path",
+            "models/Qwen3-VL-8B-Instruct",
+            "--model-repository",
+            "Qwen/Qwen3-VL-8B-Instruct",
+            "--model-family",
+            "qwen3_vl",
+            "--model-revision",
+            "revision-1",
+            "--model-manifest",
+            "outputs/model-manifest.json",
+            "--no-adapter",
             "--precision",
             "bf16",
+            "--tta",
+            "1",
+            "--tta-orders-json",
+            "[[1,2,3,4]]",
+            "--aggregation-mode",
+            "hard",
+            "--fallback-policy",
+            "identity",
             "--validation-manifest",
             "outputs/run/split_manifest.json",
         ]
@@ -42,6 +83,41 @@ def test_inference_accepts_explicit_precision_and_manifest() -> None:
 
     assert args.precision == "bf16"
     assert args.validation_manifest == Path("outputs/run/split_manifest.json")
+
+
+@pytest.mark.parametrize(
+    "omitted_flag",
+    (
+        "--model-path",
+        "--model-repository",
+        "--model-family",
+        "--model-revision",
+        "--model-manifest",
+        "--precision",
+        "--tta",
+        "--aggregation-mode",
+    ),
+)
+def test_inference_rejects_implicit_identity_or_runtime_settings(
+    omitted_flag: str,
+) -> None:
+    arguments = {
+        "--model-path": "models/Qwen3-VL-8B-Instruct",
+        "--model-repository": "Qwen/Qwen3-VL-8B-Instruct",
+        "--model-family": "qwen3_vl",
+        "--model-revision": "revision-1",
+        "--model-manifest": "outputs/model-manifest.json",
+        "--precision": "nf4",
+        "--tta": "1",
+        "--aggregation-mode": "hard",
+    }
+    argv = ["--no-adapter"]
+    for flag, value in arguments.items():
+        if flag != omitted_flag:
+            argv.extend([flag, value])
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(argv)
 
 
 def test_manifest_validation_rows_follow_manifest_order(tmp_path: Path) -> None:

@@ -1,7 +1,11 @@
 import csv
 import json
+import os
 import sys
 from pathlib import Path
+
+import psutil
+import pytest
 
 from scripts import run_phase1_sweep as runner
 
@@ -25,6 +29,22 @@ raise SystemExit({exit_code})
     return [sys.executable, "-c", code, "{attempt_dir}"]
 
 
+def test_default_child_environment_rejects_api_keys_and_authenticated_proxy(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("NVIDIA_API_KEY", "secret")
+    monkeypatch.setenv("NVIDIA_VISIBLE_DEVICES", "all")
+    monkeypatch.setenv("HTTPS_PROXY", "https://user:secret@proxy.example:443")
+    before = dict(os.environ)
+
+    child = runner.default_child_environment()
+
+    assert dict(os.environ) == before
+    assert "NVIDIA_API_KEY" not in child
+    assert "HTTPS_PROXY" not in child
+    assert child["NVIDIA_VISIBLE_DEVICES"] == "all"
+
+
 def test_runner_records_success_and_skips_valid_completed_experiment(tmp_path: Path) -> None:
     experiment = runner.Experiment(
         experiment_id="model-ckpt1-nf4-greedy-tta1-val2",
@@ -45,6 +65,28 @@ def test_runner_records_success_and_skips_valid_completed_experiment(tmp_path: P
     assert (attempt / "stderr.log").is_file()
     assert (attempt / "exit-code.txt").read_text(encoding="utf-8").strip() == "0"
     assert len((tmp_path / "experiment_registry.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_runner_interrupt_records_terminal_state(monkeypatch, tmp_path: Path) -> None:
+    experiment = runner.Experiment(
+        experiment_id="interrupted",
+        command=["tool"],
+        expected_rows=1,
+    )
+
+    def interrupt(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runner, "run_command", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        runner.run_plan([experiment], output_root=tmp_path, poll_seconds=0.01)
+
+    status = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+    record = status["experiments"]["interrupted"]
+    assert record["status"] == "interrupted"
+    assert record["ended_at"]
+    assert "active_experiment" not in status
+    assert "KeyboardInterrupt" in record["artifact_errors"][0]
 
 
 def test_runner_preserves_failed_attempt_and_stops_before_next_experiment(tmp_path: Path) -> None:
@@ -81,6 +123,28 @@ def test_artifact_validation_rejects_wrong_row_count(tmp_path: Path) -> None:
     assert any("audit" in error for error in errors)
 
 
+def test_run_command_interrupt_terminates_child_and_records_exit(
+    monkeypatch, tmp_path: Path
+) -> None:
+    attempt = tmp_path / "interrupted-attempt"
+
+    def interrupt(_seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runner.time, "sleep", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        runner.run_command(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            attempt,
+            poll_seconds=0.01,
+        )
+
+    pid = int((attempt / "pid.txt").read_text(encoding="utf-8"))
+    assert not psutil.pid_exists(pid)
+    assert (attempt / "exit-code.txt").is_file()
+    assert (attempt / "ended-at.txt").is_file()
+
+
 def test_materialize_command_replaces_attempt_placeholder_inside_paths(
     tmp_path: Path,
 ) -> None:
@@ -91,6 +155,30 @@ def test_materialize_command_replaces_attempt_placeholder_inside_paths(
     )
 
     assert concrete == ["python", "--output", str(attempt / "predictions.csv")]
+
+
+def test_phase1_inference_command_has_complete_required_identity() -> None:
+    command = runner.inference_command(
+        adapter=Path("outputs/qwen3-vl-8b-aug/checkpoint-4292"),
+        precision="nf4",
+        tta=4,
+        expected_rows=954,
+    )
+
+    for flag in (
+        "--model-path",
+        "--model-repository",
+        "--model-family",
+        "--model-revision",
+        "--model-manifest",
+        "--adapter-path",
+        "--precision",
+        "--tta",
+        "--aggregation-mode",
+        "--fallback-policy",
+        "--metrics-output",
+    ):
+        assert flag in command
 
 
 def test_refresh_checkpoint_sweep_writes_required_summary_columns(tmp_path: Path) -> None:

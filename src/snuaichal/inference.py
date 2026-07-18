@@ -16,6 +16,7 @@ from snuaichal.confidence import align_answer_confidence
 from snuaichal.modeling import apply_model_chat_template
 from snuaichal.submission import (
     answer_to_string,
+    is_permutation,
     parse_model_output,
     validate_submission_records,
 )
@@ -29,6 +30,26 @@ from snuaichal.tta import (
 )
 
 REQUIRED_COLUMNS = {"Id", "Sentence", "Input_1", "Input_2", "Input_3", "Input_4"}
+
+
+def parse_tta_orders_json(value: str) -> tuple[tuple[int, ...], ...]:
+    """Parse and validate an explicit ordered list of TTA permutations."""
+    try:
+        raw_orders = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError("TTA orders must be valid JSON") from exc
+    if not isinstance(raw_orders, list) or not raw_orders:
+        raise argparse.ArgumentTypeError("TTA orders must be a nonempty JSON list")
+    orders: list[tuple[int, ...]] = []
+    for raw_order in raw_orders:
+        if not is_permutation(raw_order):
+            raise argparse.ArgumentTypeError(
+                f"invalid TTA input order: {raw_order!r}"
+            )
+        orders.append(tuple(raw_order))
+    if len(set(orders)) != len(orders):
+        raise argparse.ArgumentTypeError("TTA orders must be unique")
+    return tuple(orders)
 
 
 @dataclass(frozen=True)
@@ -314,6 +335,7 @@ def run(args: argparse.Namespace) -> None:
             "Inference dependencies are missing. Run: pip install -r requirements.txt"
         ) from exc
 
+    from snuaichal.model_manifest import verify_model_manifest
     from snuaichal.modeling import (
         create_4bit_config,
         detect_model_family,
@@ -337,6 +359,13 @@ def run(args: argparse.Namespace) -> None:
         )
     if args.adapter_path is not None and not args.adapter_path.is_dir():
         raise FileNotFoundError(f"Local LoRA adapter not found: {args.adapter_path}")
+    verified_model_manifest = verify_model_manifest(
+        args.model_manifest,
+        model_root=args.model_path,
+        expected_repository=args.model_repository,
+        expected_revision=args.model_revision,
+        expected_family=args.model_family,
+    )
 
     test_df = pd.read_csv(test_csv, dtype={"Id": str})
     missing_columns = REQUIRED_COLUMNS.difference(test_df.columns)
@@ -373,6 +402,11 @@ def run(args: argparse.Namespace) -> None:
         args.model_path, local_files_only=not args.allow_network
     )
     family = detect_model_family(config)
+    if family.value != args.model_family:
+        raise RuntimeError(
+            f"Detected model family {family.value!r} differs from declared "
+            f"{args.model_family!r}"
+        )
     model_class = resolve_model_class(config, transformers)
     model_kwargs = build_model_load_kwargs(
         precision=precision,
@@ -416,7 +450,17 @@ def run(args: argparse.Namespace) -> None:
     all_image_grids: list[list[int]] = []
     all_visual_tokens: list[int] = []
     parse_failures = 0
-    tta_orders = CYCLIC_TTA_ORDERS[:1] if args.tta == 1 else CYCLIC_TTA_ORDERS
+    tta_orders = (
+        args.tta_orders
+        if args.tta_orders is not None
+        else (CYCLIC_TTA_ORDERS[:1] if args.tta == 1 else CYCLIC_TTA_ORDERS)
+    )
+    if len(tta_orders) != args.tta:
+        raise ValueError(
+            f"Explicit TTA order count {len(tta_orders)} does not match --tta {args.tta}"
+        )
+    if args.fallback_policy != "identity":
+        raise ValueError(f"Unsupported fallback policy: {args.fallback_policy}")
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     inference_started = time.perf_counter()
@@ -543,29 +587,51 @@ def run(args: argparse.Namespace) -> None:
 
     print(f"Saved {len(predictions)} predictions to {args.output}")
     print(f"Parse failures: {parse_failures}/{len(predictions)}")
+    peak_vram_bytes = (
+        torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+    )
+    seconds_per_sample = elapsed_seconds / len(predictions)
+    metrics: dict[str, Any] = {
+        "samples": len(predictions),
+        "parse_failures": parse_failures,
+        "parse_failure_rate": parse_failures / len(predictions),
+        "inference_seconds_per_sample": seconds_per_sample,
+        "estimated_test_seconds": seconds_per_sample * 819,
+        "peak_vram_mib": peak_vram_bytes / (1024 * 1024),
+        "model_precision": precision,
+    }
     if metric_references:
         from snuaichal.evaluation import (
             compare_prediction_modes,
             compute_exact_match_metrics,
         )
 
-        peak_vram_bytes = (
-            torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
-        )
-        metrics = compute_exact_match_metrics(
-            metric_predictions,
-            metric_references,
-            tta_consistent=tta_consistency,
-            no_ordering=metric_no_ordering or None,
-            tta_agreement_patterns=metric_tta_patterns,
-            elapsed_seconds=elapsed_seconds,
-            peak_vram_bytes=peak_vram_bytes,
-            model_precision=precision,
-            image_grid_thw=all_image_grids,
-            visual_tokens=all_visual_tokens,
+        metrics.update(
+            compute_exact_match_metrics(
+                metric_predictions,
+                metric_references,
+                tta_consistent=tta_consistency,
+                no_ordering=metric_no_ordering or None,
+                tta_agreement_patterns=metric_tta_patterns,
+                elapsed_seconds=elapsed_seconds,
+                peak_vram_bytes=peak_vram_bytes,
+                model_precision=precision,
+                image_grid_thw=all_image_grids,
+                visual_tokens=all_visual_tokens,
+            )
         )
         metrics.update(
             {
+                "non_identity_exact_matches": sum(
+                    prediction is not None and prediction == reference
+                    for prediction, reference, no_ordering in zip(
+                        metric_predictions,
+                        metric_references,
+                        metric_no_ordering,
+                        strict=True,
+                    )
+                    if not no_ordering
+                ),
                 "aggregation_comparison": {
                     mode: {
                         "vs_hard": compare_prediction_modes(
@@ -581,21 +647,35 @@ def run(args: argparse.Namespace) -> None:
                     }
                     for mode, mode_predictions in metric_predictions_by_mode.items()
                 },
-                "aggregation_mode": args.aggregation_mode,
-                "adapter_path": str(args.adapter_path) if args.adapter_path else None,
-                "base_model_path": str(args.model_path),
-                "confidence_temperature": args.confidence_temperature,
-                "max_pixels": args.max_pixels or args.image_size**2,
-                "min_pixels": args.min_pixels,
-                "runtime_state": runtime_state,
-                "tta_views": args.tta,
             }
         )
-        args.metrics_output.parent.mkdir(parents=True, exist_ok=True)
-        args.metrics_output.write_text(
-            json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
-        print(json.dumps(metrics, sort_keys=True))
+    metrics.update(
+        {
+            "aggregation_mode": args.aggregation_mode,
+            "adapter_path": str(args.adapter_path) if args.adapter_path else None,
+            "base_model_path": str(args.model_path),
+            "model_repository": args.model_repository,
+            "model_family": family.value,
+            "detected_model_family": family.value,
+            "declared_model_family": args.model_family,
+            "model_revision": args.model_revision,
+            "model_manifest_path": str(args.model_manifest),
+            "model_manifest_sha256": verified_model_manifest["manifest_sha256"],
+            "verified_model_tree_sha256": verified_model_manifest["tree_sha256"],
+            "confidence_temperature": args.confidence_temperature,
+            "fallback_policy": args.fallback_policy,
+            "max_pixels": args.max_pixels or args.image_size**2,
+            "min_pixels": args.min_pixels,
+            "runtime_state": runtime_state,
+            "tta_orders": [list(order) for order in tta_orders],
+            "tta_views": len(tta_orders),
+        }
+    )
+    args.metrics_output.parent.mkdir(parents=True, exist_ok=True)
+    args.metrics_output.write_text(
+        json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    print(json.dumps(metrics, sort_keys=True))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -603,10 +683,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--test-csv", type=Path)
     parser.add_argument("--image-dir", type=Path)
+    parser.add_argument("--model-path", type=Path, required=True)
+    parser.add_argument("--model-repository", required=True)
     parser.add_argument(
-        "--model-path", type=Path, default=Path("models/Qwen2-VL-2B-Instruct")
+        "--model-family",
+        choices=("qwen2_vl", "qwen3_vl", "qwen3_vl_moe", "qwen3_5"),
+        required=True,
     )
-    parser.add_argument("--adapter-path", type=Path)
+    parser.add_argument("--model-revision", required=True)
+    parser.add_argument("--model-manifest", type=Path, required=True)
+    adapter_group = parser.add_mutually_exclusive_group(required=True)
+    adapter_group.add_argument("--adapter-path", type=Path)
+    adapter_group.add_argument(
+        "--no-adapter",
+        action="store_true",
+        help="Explicitly run the base model without a PEFT adapter",
+    )
     parser.add_argument(
         "--validation-fraction",
         type=float,
@@ -637,6 +729,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--precision",
         choices=("nf4", "bf16"),
+        required=True,
         help="Explicit base-model inference precision",
     )
     parser.add_argument(
@@ -644,11 +737,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Deprecated compatibility alias for --precision nf4",
     )
-    parser.add_argument("--tta", type=int, choices=(1, 4), default=1)
+    parser.add_argument("--tta", type=int, choices=(1, 4), required=True)
+    parser.add_argument(
+        "--tta-orders-json",
+        dest="tta_orders",
+        type=parse_tta_orders_json,
+        help="Explicit ordered JSON list of TTA input permutations",
+    )
     parser.add_argument(
         "--aggregation-mode",
         choices=("hard", "confidence_tiebreak", "confidence_weighted"),
-        default="hard",
+        required=True,
+    )
+    parser.add_argument(
+        "--fallback-policy",
+        choices=("identity",),
+        default="identity",
+        help="Explicit policy used when every TTA view fails to parse",
     )
     parser.add_argument("--confidence-temperature", type=float, default=1.0)
     parser.add_argument(

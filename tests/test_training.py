@@ -9,9 +9,11 @@ from snuaichal.training import (
     build_parser,
     build_training_argument_kwargs,
     build_training_messages,
+    build_training_summary,
     image_dhash,
     permute_training_row,
     seed_training,
+    select_training_rows,
     split_rows,
     split_rows_without_image_overlap,
     write_or_validate_manifest,
@@ -180,6 +182,28 @@ def test_split_rows_is_deterministic_and_disjoint() -> None:
     )
 
 
+def test_training_row_limit_applies_after_the_full_dataset_split() -> None:
+    rows = [
+        {"Id": f"sample-{index}", "Answer": "[1, 2, 3, 4]"}
+        for index in range(20)
+    ]
+    full_train, full_validation = split_rows(
+        rows, validation_fraction=0.2, seed=42
+    )
+
+    train_rows, validation_rows = select_training_rows(
+        rows,
+        image_dir=Path("unused"),
+        validation_fraction=0.2,
+        seed=42,
+        limit=10,
+        clean_validation=False,
+    )
+
+    assert train_rows == full_train[:8]
+    assert validation_rows == full_validation[:2]
+
+
 def test_training_defaults_fit_a_single_24gb_gpu() -> None:
     args = build_parser().parse_args([])
 
@@ -197,6 +221,21 @@ def test_training_defaults_fit_a_single_24gb_gpu() -> None:
     assert training_kwargs["save_total_limit"] is None
     assert training_kwargs["lr_scheduler_type"] == "cosine"
     assert training_kwargs["max_steps"] == -1
+
+
+def test_training_summary_records_optimizer_step_timing() -> None:
+    summary = build_training_summary(
+        global_step=2,
+        epoch=0.01,
+        learning_rate=1e-4,
+        training_loss=0.5,
+        peak_vram_bytes=20_000,
+        train_metrics={"train_runtime": 100.0, "train_steps_per_second": 0.02},
+    )
+
+    assert summary["train_runtime_seconds"] == 100.0
+    assert summary["train_steps_per_second"] == 0.02
+    assert summary["seconds_per_optimizer_step"] == 50.0
 
 
 def test_training_seed_reproduces_torch_and_python_randomness() -> None:

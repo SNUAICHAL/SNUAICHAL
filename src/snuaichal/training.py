@@ -148,6 +148,36 @@ def split_rows_without_image_overlap(
     return train_rows, validation_rows
 
 
+def select_training_rows(
+    rows: list[Any],
+    *,
+    image_dir: Path,
+    validation_fraction: float,
+    seed: int,
+    limit: int | None,
+    clean_validation: bool,
+) -> tuple[list[Any], list[Any]]:
+    """Apply the production split to all rows before limiting each partition."""
+    if clean_validation:
+        train_rows, validation_rows = split_rows_without_image_overlap(
+            rows,
+            image_dir=image_dir,
+            validation_fraction=validation_fraction,
+            seed=seed,
+        )
+    else:
+        train_rows, validation_rows = split_rows(
+            rows, validation_fraction=validation_fraction, seed=seed
+        )
+    if limit is not None:
+        if limit < 2:
+            raise ValueError("limit must be at least 2")
+        limited_validation_size = max(1, round(limit * validation_fraction))
+        validation_rows = validation_rows[:limited_validation_size]
+        train_rows = train_rows[: limit - limited_validation_size]
+    return train_rows, validation_rows
+
+
 def permute_training_row(row: Any, input_order: list[int]) -> dict[str, Any]:
     """Reorder input slots and move each frame's target position with it."""
     if not is_permutation(input_order):
@@ -323,6 +353,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model-path", type=Path, default=Path("models/Qwen2-VL-2B-Instruct")
     )
+    parser.add_argument("--model-repository")
+    parser.add_argument("--model-family")
+    parser.add_argument("--model-revision")
+    parser.add_argument("--model-manifest", type=Path)
     parser.add_argument(
         "--output-dir", type=Path, default=Path("outputs/qwen2-vl-lora")
     )
@@ -453,12 +487,45 @@ def build_training_argument_kwargs(
     }
 
 
+def build_training_summary(
+    *,
+    global_step: int,
+    epoch: float | None,
+    learning_rate: float,
+    training_loss: float,
+    peak_vram_bytes: int,
+    train_metrics: dict[str, Any],
+) -> dict[str, Any]:
+    """Build an auditable training summary including optimizer-step timing."""
+    steps_per_second = train_metrics.get("train_steps_per_second")
+    steps_per_second = (
+        float(steps_per_second) if steps_per_second is not None else None
+    )
+    return {
+        "global_step": int(global_step),
+        "epoch": epoch,
+        "learning_rate": float(learning_rate),
+        "training_loss": float(training_loss),
+        "peak_vram_bytes": int(peak_vram_bytes),
+        "train_runtime_seconds": (
+            float(train_metrics["train_runtime"])
+            if train_metrics.get("train_runtime") is not None
+            else None
+        ),
+        "train_steps_per_second": steps_per_second,
+        "seconds_per_optimizer_step": (
+            1.0 / steps_per_second if steps_per_second and steps_per_second > 0 else None
+        ),
+    }
+
+
 def run(args: argparse.Namespace) -> None:
     import torch
     import transformers
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
     from transformers import AutoConfig, AutoProcessor, TrainingArguments
 
+    from snuaichal.model_manifest import verify_model_manifest
     from snuaichal.modeling import (
         count_parameters,
         create_4bit_config,
@@ -470,6 +537,23 @@ def run(args: argparse.Namespace) -> None:
     )
 
     seed_training(args.seed)
+    model_identity_values = (
+        args.model_repository,
+        args.model_family,
+        args.model_revision,
+        args.model_manifest,
+    )
+    if any(value is None for value in model_identity_values):
+        raise ValueError(
+            "training requires model repository, family, revision, and manifest"
+        )
+    verified_model_manifest = verify_model_manifest(
+        args.model_manifest,
+        model_root=args.model_path,
+        expected_repository=args.model_repository,
+        expected_revision=args.model_revision,
+        expected_family=args.model_family,
+    )
 
     train_csv = args.data_dir / "train.csv"
     image_dir = args.data_dir / "train"
@@ -501,23 +585,14 @@ def run(args: argparse.Namespace) -> None:
     missing_columns = required_columns.difference(rows[0])
     if missing_columns:
         raise ValueError(f"Missing train.csv columns: {sorted(missing_columns)}")
-    if args.clean_validation:
-        train_rows, validation_rows = split_rows_without_image_overlap(
-            rows,
-            image_dir=image_dir,
-            validation_fraction=args.validation_fraction,
-            seed=args.seed,
-        )
-    else:
-        train_rows, validation_rows = split_rows(
-            rows, validation_fraction=args.validation_fraction, seed=args.seed
-        )
-    if args.limit is not None:
-        if args.limit < 2:
-            raise ValueError("limit must be at least 2")
-        limited_validation_size = max(1, round(args.limit * args.validation_fraction))
-        validation_rows = validation_rows[:limited_validation_size]
-        train_rows = train_rows[: args.limit - limited_validation_size]
+    train_rows, validation_rows = select_training_rows(
+        rows,
+        image_dir=image_dir,
+        validation_fraction=args.validation_fraction,
+        seed=args.seed,
+        limit=args.limit,
+        clean_validation=args.clean_validation,
+    )
     write_split_manifest(
         args.output_dir,
         train_rows=train_rows,
@@ -602,6 +677,10 @@ def run(args: argparse.Namespace) -> None:
         "architecture": model_class.__name__,
         "model_type": config.model_type,
         "model_path": str(args.model_path),
+        "model_repository": args.model_repository,
+        "model_revision": args.model_revision,
+        "model_manifest_sha256": verified_model_manifest["manifest_sha256"],
+        "verified_model_tree_sha256": verified_model_manifest["tree_sha256"],
         "load_in_4bit": args.load_in_4bit,
         "lora_rank": lora_rank,
         "lora_alpha": args.lora_alpha,
@@ -644,13 +723,14 @@ def run(args: argparse.Namespace) -> None:
             str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None
         )
     )
-    summary = {
-        "global_step": trainer.state.global_step,
-        "epoch": trainer.state.epoch,
-        "learning_rate": trainer._get_learning_rate(),
-        "training_loss": train_result.training_loss,
-        "peak_vram_bytes": torch.cuda.max_memory_allocated(),
-    }
+    summary = build_training_summary(
+        global_step=trainer.state.global_step,
+        epoch=trainer.state.epoch,
+        learning_rate=trainer._get_learning_rate(),
+        training_loss=train_result.training_loss,
+        peak_vram_bytes=torch.cuda.max_memory_allocated(),
+        train_metrics=train_result.metrics,
+    )
     (args.output_dir / "training_summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )

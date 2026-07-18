@@ -29,8 +29,25 @@ SWEEP_ROOT = ROOT / "outputs" / "phase1"
 FOLLOWUP_ROOT = ROOT / "outputs" / "phase1_followup"
 SWEEP_CSV = ROOT / "outputs" / "checkpoint_sweep.csv"
 MODEL_8B = ROOT / "models" / "Qwen3-VL-8B-Instruct"
+MODEL_8B_REPOSITORY = "Qwen/Qwen3-VL-8B-Instruct"
+MODEL_8B_REVISION = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
+MODEL_8B_MANIFEST = (
+    ROOT
+    / "outputs"
+    / "blocked_low_validation_resume"
+    / "model-manifests"
+    / f"qwen3-vl-8b-{MODEL_8B_REVISION}.json"
+)
 MODEL_27B = ROOT / "models" / "Qwen3.5-27B"
+MODEL_27B_REPOSITORY = "Qwen/Qwen3.5-27B"
 MODEL_27B_REVISION = "fc05daec18b0a78c049392ed2e771dde82bdf654"
+MODEL_27B_MANIFEST = (
+    ROOT
+    / "outputs"
+    / "blocked_low_validation_resume"
+    / "model-manifests"
+    / f"qwen35-27b-{MODEL_27B_REVISION}.json"
+)
 EXPECTED_SWEEP_STEPS = (3000, 3500, 3750, 4000, 4250, 4292)
 COHERENCE_THRESHOLD = 0.70
 COMPETITION = "snuaichallenge"
@@ -179,6 +196,14 @@ def inference_command(*, step: int, precision: str, tta: int) -> list[str]:
         "data/train",
         "--model-path",
         str(MODEL_8B.relative_to(ROOT)),
+        "--model-repository",
+        MODEL_8B_REPOSITORY,
+        "--model-family",
+        "qwen3_vl",
+        "--model-revision",
+        MODEL_8B_REVISION,
+        "--model-manifest",
+        str(MODEL_8B_MANIFEST.relative_to(ROOT)),
         "--adapter-path",
         f"outputs/qwen3-vl-8b-aug/checkpoint-{step}",
         "--validation-manifest",
@@ -189,6 +214,8 @@ def inference_command(*, step: int, precision: str, tta: int) -> list[str]:
         str(tta),
         "--aggregation-mode",
         "hard",
+        "--fallback-policy",
+        "identity",
         "--output",
         "{attempt_dir}/predictions.csv",
         "--audit-log",
@@ -210,6 +237,14 @@ def official_inference_command(attempt: Path) -> list[str]:
         "data/test",
         "--model-path",
         str(MODEL_8B.relative_to(ROOT)),
+        "--model-repository",
+        MODEL_8B_REPOSITORY,
+        "--model-family",
+        "qwen3_vl",
+        "--model-revision",
+        MODEL_8B_REVISION,
+        "--model-manifest",
+        str(MODEL_8B_MANIFEST.relative_to(ROOT)),
         "--adapter-path",
         "outputs/qwen3-vl-8b-aug/checkpoint-4292",
         "--precision",
@@ -220,10 +255,14 @@ def official_inference_command(attempt: Path) -> list[str]:
         "4",
         "--aggregation-mode",
         "confidence_tiebreak",
+        "--fallback-policy",
+        "identity",
         "--output",
         str(attempt / OFFICIAL_SUBMISSION_NAME),
         "--audit-log",
         str(attempt / OFFICIAL_AUDIT_NAME),
+        "--metrics-output",
+        str(attempt / "metrics.json"),
     ]
 
 
@@ -648,30 +687,21 @@ def training_smoke_validator(_attempt: Path) -> list[str]:
     return [str(path) for path in required if not path.is_file()]
 
 
-def run_qwen35_smoke(*, poll_seconds: float) -> dict[str, Any]:
-    hf = ROOT / ".venv" / "Scripts" / "hf.exe"
-    download_command = [
-        str(hf),
-        "download",
-        "Qwen/Qwen3.5-27B",
-        "--revision",
-        MODEL_27B_REVISION,
-        "--local-dir",
-        str(MODEL_27B),
-    ]
-    run_generic_stage(
-        "qwen35-27b-download",
-        download_command,
-        validator=download_validator,
-        poll_seconds=poll_seconds,
-    )
-    output = ROOT / "outputs" / "qwen3-5-27b-smoke-2step"
-    training_command = [
+def qwen35_training_command(output: Path) -> list[str]:
+    return [
         sys.executable,
         "-m",
         "snuaichal.training",
         "--model-path",
         str(MODEL_27B.relative_to(ROOT)),
+        "--model-repository",
+        MODEL_27B_REPOSITORY,
+        "--model-family",
+        "qwen3_5",
+        "--model-revision",
+        MODEL_27B_REVISION,
+        "--model-manifest",
+        str(MODEL_27B_MANIFEST.relative_to(ROOT)),
         "--output-dir",
         str(output.relative_to(ROOT)),
         "--load-in-4bit",
@@ -700,6 +730,27 @@ def run_qwen35_smoke(*, poll_seconds: float) -> dict[str, Any]:
         "--limit",
         "48",
     ]
+
+
+def run_qwen35_smoke(*, poll_seconds: float) -> dict[str, Any]:
+    hf = ROOT / ".venv" / "Scripts" / "hf.exe"
+    download_command = [
+        str(hf),
+        "download",
+        "Qwen/Qwen3.5-27B",
+        "--revision",
+        MODEL_27B_REVISION,
+        "--local-dir",
+        str(MODEL_27B),
+    ]
+    run_generic_stage(
+        "qwen35-27b-download",
+        download_command,
+        validator=download_validator,
+        poll_seconds=poll_seconds,
+    )
+    output = ROOT / "outputs" / "qwen3-5-27b-smoke-2step"
+    training_command = qwen35_training_command(output)
     run_generic_stage(
         "qwen35-27b-training-smoke-2step",
         training_command,
@@ -728,28 +779,8 @@ def run_queue(*, runner_pid: int | None, poll_seconds: float) -> dict[str, Any]:
         [result.__dict__ for result in results],
     )
 
-    official_attempt = run_official_inference_stage(poll_seconds=poll_seconds)
     official_submission: dict[str, Any] | None = None
     official_submission_error: str | None = None
-    try:
-        official_submission = submit_official_attempt(
-            official_attempt, poll_seconds=poll_seconds
-        )
-    except Exception as exc:
-        official_submission_error = repr(exc)
-        atomic_json(
-            FOLLOWUP_ROOT / "official-submission-error.json",
-            {
-                "error": official_submission_error,
-                "submission_file": str(official_attempt / OFFICIAL_SUBMISSION_NAME),
-                "updated_at": runner.utc_now(),
-            },
-        )
-        update_queue_status(
-            state="official_submission_failed_followup_continuing",
-            active_stage=None,
-            submission_error=official_submission_error,
-        )
 
     bf16 = run_inference_stage(
         f"qwen3vl8b-ckpt{best.step}-bf16-greedy-tta1-val954",
