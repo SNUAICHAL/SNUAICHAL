@@ -664,6 +664,237 @@ def test_training_validator_rejects_impossible_smoke_metrics(
     assert errors
 
 
+def test_training_validator_accepts_reserved_peak_below_physical_when_sum_exceeds_it(
+    tmp_path,
+) -> None:
+    output = tmp_path / "training"
+    checkpoint = output / "checkpoint-2"
+    final = output / "final"
+    checkpoint.mkdir(parents=True)
+    final.mkdir(parents=True)
+    (tmp_path / "pid.txt").write_text("1234\n")
+    gib = 1024**3
+    summary = {
+        "global_step": 2,
+        "epoch": 0.25,
+        "learning_rate": 1e-4,
+        "training_loss": 0.5,
+        "train_runtime_seconds": 100.0,
+        "train_steps_per_second": 0.02,
+        "seconds_per_optimizer_step": 50.0,
+        "initial_global_step": 0,
+        "optimizer_steps_this_run": 2,
+        "memory_schema_version": 3,
+        "logical_peak_allocated_bytes": 20 * gib,
+        "logical_peak_reserved_bytes": 23 * gib,
+        "allocator_backend": "native",
+        "allocator_memory_semantics": resume.ALLOCATOR_MEMORY_SEMANTICS,
+        "physical_total_vram_bytes": 24 * gib,
+        "physical_peak_observed_bytes": 21 * gib,
+        "physical_measurement_source": "nvml_per_process_used_bytes",
+        "sample_count": 4,
+        "sample_interval_seconds": 0.5,
+        "sampling_started_at": "2026-07-18T00:00:00+00:00",
+        "sampling_ended_at": "2026-07-18T00:01:00+00:00",
+        "sampling_started_before_model_load": True,
+        "sampling_finished_after_work": True,
+        "process_identity_match": True,
+        "trusted_process_identity": {
+            "pid": 1234,
+            "create_time": 1.0,
+            "command_identity": "a" * 64,
+        },
+        "trusted_cuda_child_seen": True,
+        "unexpected_cuda_processes": [],
+        "device_fallback_exclusive": True,
+        "process_memory_unavailable": False,
+        "process_sample_count": 4,
+        "device_sample_count": 4,
+        "physical_measurement_status": "valid",
+        "physical_measurement_reason": None,
+        "continuation_gate_source": "nvml_per_process_used_bytes",
+        "continuation_gate_bytes": 21 * gib,
+    }
+    assert summary["logical_peak_allocated_bytes"] + summary[
+        "logical_peak_reserved_bytes"
+    ] > summary["physical_total_vram_bytes"]
+    (output / "training_summary.json").write_text(json.dumps(summary))
+    physical_fields = {
+        "schema_version": 1,
+        **{
+            key: value
+            for key, value in summary.items()
+            if key
+            in {
+                "physical_total_vram_bytes",
+                "physical_peak_observed_bytes",
+                "physical_measurement_source",
+                "sample_count",
+                "sample_interval_seconds",
+                "sampling_started_at",
+                "sampling_ended_at",
+                "sampling_started_before_model_load",
+                "sampling_finished_after_work",
+                "process_identity_match",
+                "trusted_process_identity",
+                "trusted_cuda_child_seen",
+                "unexpected_cuda_processes",
+                "device_fallback_exclusive",
+                "process_memory_unavailable",
+                "process_sample_count",
+                "device_sample_count",
+                "physical_measurement_status",
+                "physical_measurement_reason",
+                "continuation_gate_source",
+                "continuation_gate_bytes",
+            }
+        },
+    }
+    (output / "physical_memory_measurement.json").write_text(
+        json.dumps(physical_fields)
+    )
+    (output / "model_manifest.json").write_text(
+        json.dumps(
+            {
+                "load_in_4bit": True,
+                "trainable_parameters": 100,
+                "total_parameters": 1_000,
+                "model_path": "models/Qwen3.5-27B",
+                "lora_rank": 8,
+            }
+        )
+    )
+    (output / "schedule.json").write_text(json.dumps({"stop_after_steps": 2}))
+    (checkpoint / "trainer_state.json").write_text(json.dumps({"global_step": 2}))
+    for path in [
+        final / "adapter_config.json",
+        final / "adapter_model.safetensors",
+        checkpoint / "adapter_config.json",
+        checkpoint / "adapter_model.safetensors",
+        checkpoint / "optimizer.pt",
+        checkpoint / "scheduler.pt",
+        checkpoint / "rng_state.pth",
+        checkpoint / "training_args.bin",
+    ]:
+        path.write_bytes(b"nonempty")
+
+    assert resume.training_validator(2)(tmp_path) == []
+
+
+def test_training_validator_rejects_inconsistent_vram_gate_relationships(
+    tmp_path,
+) -> None:
+    output = tmp_path / "training"
+    checkpoint = output / "checkpoint-2"
+    final = output / "final"
+    checkpoint.mkdir(parents=True)
+    final.mkdir(parents=True)
+    (tmp_path / "pid.txt").write_text("1234\n")
+    gib = 1024**3
+    summary = {
+        "global_step": 2,
+        "epoch": 0.25,
+        "learning_rate": 1e-4,
+        "training_loss": 0.5,
+        "train_runtime_seconds": 100.0,
+        "train_steps_per_second": 0.02,
+        "seconds_per_optimizer_step": 50.0,
+        "initial_global_step": 0,
+        "optimizer_steps_this_run": 2,
+        "memory_schema_version": 3,
+        "logical_peak_allocated_bytes": 23 * gib,
+        "logical_peak_reserved_bytes": 20 * gib,
+        "allocator_backend": "native",
+        "allocator_memory_semantics": resume.ALLOCATOR_MEMORY_SEMANTICS,
+        "physical_total_vram_bytes": 24 * gib,
+        "physical_peak_observed_bytes": 21 * gib,
+        "physical_measurement_source": "nvml_per_process_used_bytes",
+        "sample_count": 4,
+        "sample_interval_seconds": 0.5,
+        "sampling_started_at": "2026-07-18T00:00:00+00:00",
+        "sampling_ended_at": "2026-07-18T00:01:00+00:00",
+        "sampling_started_before_model_load": True,
+        "sampling_finished_after_work": True,
+        "process_identity_match": True,
+        "trusted_process_identity": {
+            "pid": 1234,
+            "create_time": 1.0,
+            "command_identity": "a" * 64,
+        },
+        "trusted_cuda_child_seen": True,
+        "unexpected_cuda_processes": [],
+        "device_fallback_exclusive": True,
+        "process_memory_unavailable": False,
+        "process_sample_count": 4,
+        "device_sample_count": 4,
+        "physical_measurement_status": "valid",
+        "physical_measurement_reason": None,
+        "continuation_gate_source": "nvml_per_process_used_bytes",
+        "continuation_gate_bytes": 19 * gib,
+    }
+    (output / "training_summary.json").write_text(json.dumps(summary))
+    physical_keys = {
+        "physical_total_vram_bytes",
+        "physical_peak_observed_bytes",
+        "physical_measurement_source",
+        "sample_count",
+        "sample_interval_seconds",
+        "sampling_started_at",
+        "sampling_ended_at",
+        "sampling_started_before_model_load",
+        "sampling_finished_after_work",
+        "process_identity_match",
+        "trusted_process_identity",
+        "trusted_cuda_child_seen",
+        "unexpected_cuda_processes",
+        "device_fallback_exclusive",
+        "process_memory_unavailable",
+        "process_sample_count",
+        "device_sample_count",
+        "physical_measurement_status",
+        "physical_measurement_reason",
+        "continuation_gate_source",
+        "continuation_gate_bytes",
+    }
+    (output / "physical_memory_measurement.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                **{key: summary[key] for key in physical_keys},
+            }
+        )
+    )
+    (output / "model_manifest.json").write_text(
+        json.dumps(
+            {
+                "load_in_4bit": True,
+                "trainable_parameters": 100,
+                "total_parameters": 1_000,
+                "model_path": "models/Qwen3.5-27B",
+                "lora_rank": 8,
+            }
+        )
+    )
+    (output / "schedule.json").write_text(json.dumps({"stop_after_steps": 2}))
+    (checkpoint / "trainer_state.json").write_text(json.dumps({"global_step": 2}))
+    for path in [
+        final / "adapter_config.json",
+        final / "adapter_model.safetensors",
+        checkpoint / "adapter_config.json",
+        checkpoint / "adapter_model.safetensors",
+        checkpoint / "optimizer.pt",
+        checkpoint / "scheduler.pt",
+        checkpoint / "rng_state.pth",
+        checkpoint / "training_args.bin",
+    ]:
+        path.write_bytes(b"nonempty")
+
+    errors = resume.training_validator(2)(tmp_path)
+
+    assert any("allocated" in error and "reserved" in error for error in errors)
+    assert any("continuation gate" in error for error in errors)
+
+
 def test_run_stage_reuses_only_exact_provenance(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(resume, "RESUME_ROOT", tmp_path)
     monkeypatch.setattr(resume, "STAGES_ROOT", tmp_path / "stages")
@@ -1092,20 +1323,56 @@ def _write_valid_training_attempt(attempt: Path, step: int) -> Path:
     final = output / "final"
     checkpoint.mkdir(parents=True)
     final.mkdir(parents=True)
-    (output / "training_summary.json").write_text(
-        json.dumps(
-            {
-                "global_step": step,
-                "epoch": 0.1,
-                "learning_rate": 1e-4,
-                "training_loss": 0.5,
-                "train_runtime_seconds": 100.0,
-                "train_steps_per_second": 0.02,
-                "seconds_per_optimizer_step": 50.0,
-                "peak_vram_bytes": 20 * 1024**3,
-            }
-        )
-    )
+    (attempt / "pid.txt").write_text("1234\n")
+    initial_step = 2 if step == 3 else 0
+    completed_steps = step - initial_step
+    physical = {
+        "schema_version": 1,
+        "physical_total_vram_bytes": 24 * 1024**3,
+        "physical_peak_observed_bytes": 20 * 1024**3,
+        "physical_measurement_source": "nvml_per_process_used_bytes",
+        "sample_count": 4,
+        "sample_interval_seconds": 0.5,
+        "sampling_started_at": "2026-07-18T00:00:00+00:00",
+        "sampling_ended_at": "2026-07-18T00:01:00+00:00",
+        "sampling_started_before_model_load": True,
+        "sampling_finished_after_work": True,
+        "process_identity_match": True,
+        "trusted_process_identity": {
+            "pid": 1234,
+            "create_time": 1.0,
+            "command_identity": "a" * 64,
+        },
+        "trusted_cuda_child_seen": True,
+        "unexpected_cuda_processes": [],
+        "device_fallback_exclusive": True,
+        "process_memory_unavailable": False,
+        "process_sample_count": 4,
+        "device_sample_count": 4,
+        "physical_measurement_status": "valid",
+        "physical_measurement_reason": None,
+        "continuation_gate_source": "nvml_per_process_used_bytes",
+        "continuation_gate_bytes": 20 * 1024**3,
+    }
+    summary = {
+        "global_step": step,
+        "initial_global_step": initial_step,
+        "optimizer_steps_this_run": completed_steps,
+        "epoch": 0.1,
+        "learning_rate": 1e-4,
+        "training_loss": 0.5,
+        "train_runtime_seconds": 100.0,
+        "train_steps_per_second": completed_steps / 100.0,
+        "seconds_per_optimizer_step": 100.0 / completed_steps,
+        "memory_schema_version": 3,
+        "logical_peak_allocated_bytes": 19 * 1024**3,
+        "logical_peak_reserved_bytes": 20 * 1024**3,
+        "allocator_backend": "native",
+        "allocator_memory_semantics": resume.ALLOCATOR_MEMORY_SEMANTICS,
+        **{key: value for key, value in physical.items() if key != "schema_version"},
+    }
+    (output / "training_summary.json").write_text(json.dumps(summary))
+    (output / "physical_memory_measurement.json").write_text(json.dumps(physical))
     (output / "model_manifest.json").write_text(
         json.dumps(
             {
@@ -1138,6 +1405,31 @@ def _write_valid_training_attempt(attempt: Path, step: int) -> Path:
     return checkpoint
 
 
+def test_source_inventory_includes_physical_monitor() -> None:
+    source_hashes = resume._source_hashes()
+
+    assert "src/snuaichal/physical_memory.py" in source_hashes
+
+
+def test_training_validator_rejects_monitor_pid_different_from_launched_child(
+    tmp_path,
+) -> None:
+    attempt = tmp_path / "attempt"
+    _write_valid_training_attempt(attempt, 2)
+    physical_path = attempt / "training" / "physical_memory_measurement.json"
+    summary_path = attempt / "training" / "training_summary.json"
+    physical = json.loads(physical_path.read_text())
+    summary = json.loads(summary_path.read_text())
+    physical["trusted_process_identity"]["pid"] = 9999
+    summary["trusted_process_identity"]["pid"] = 9999
+    physical_path.write_text(json.dumps(physical))
+    summary_path.write_text(json.dumps(summary))
+
+    errors = resume.training_validator(2)(attempt)
+
+    assert "monitor PID differs from the launched CUDA child" in errors
+
+
 def test_training_validator_checks_checkpoint_state_and_exact_resume(tmp_path) -> None:
     source_attempt = tmp_path / "source"
     source = _write_valid_training_attempt(source_attempt, 2)
@@ -1150,6 +1442,23 @@ def test_training_validator_checks_checkpoint_state_and_exact_resume(tmp_path) -
     (target / "trainer_state.json").write_text(json.dumps({"global_step": 2}))
     errors = resume.training_validator(3, resume_from_checkpoint=source)(target_attempt)
     assert any("trainer_state" in error for error in errors)
+
+
+def test_step3_validator_rejects_checkpoint1_and_source_identity_drift(tmp_path) -> None:
+    checkpoint1 = _write_valid_training_attempt(tmp_path / "source-1", 1)
+    target_attempt = tmp_path / "target"
+    _write_valid_training_attempt(target_attempt, 3)
+
+    errors = resume.training_validator(
+        3, resume_from_checkpoint=checkpoint1
+    )(target_attempt)
+    assert any("exact checkpoint-2" in error for error in errors)
+
+    checkpoint2 = _write_valid_training_attempt(tmp_path / "source-2", 2)
+    validator = resume.training_validator(3, resume_from_checkpoint=checkpoint2)
+    (checkpoint2 / "optimizer.pt").write_bytes(b"changed-after-launch")
+    errors = validator(target_attempt)
+    assert any("identity changed" in error for error in errors)
 
 
 def _anchor_training_attempt(attempt: Path, context: dict) -> None:
@@ -1547,6 +1856,11 @@ def test_runner_lock_and_cuda_ownership_guards(monkeypatch, tmp_path) -> None:
         resume,
         "cuda_compute_processes",
         lambda: [{"pid": 999, "process_name": "python.exe"}],
+    )
+    monkeypatch.setattr(
+        resume,
+        "cuda_workload_identity",
+        lambda pid: {"pid": pid, "process_name": "python.exe"},
     )
     with pytest.raises(RuntimeError, match="CUDA"):
         resume.assert_no_foreign_cuda_processes()

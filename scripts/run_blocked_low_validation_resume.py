@@ -19,6 +19,7 @@ import sys
 import time
 import traceback
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -36,6 +37,8 @@ from snuaichal.model_manifest import (
     write_revision_marker,
 )
 from snuaichal.submission import is_permutation
+from snuaichal.physical_memory import cuda_workload_identity
+from snuaichal.training import ALLOCATOR_MEMORY_SEMANTICS
 
 
 AGGREGATION_MODES = ("hard", "confidence_tiebreak", "confidence_weighted")
@@ -45,6 +48,14 @@ STAGES_ROOT = RESUME_ROOT / "stages"
 STATUS_PATH = RESUME_ROOT / "status.json"
 REGISTRY_PATH = RESUME_ROOT / "experiment_registry.jsonl"
 RUNNER_LOCK_PATH = RESUME_ROOT / "runner-lock.json"
+CORRECTIVE_AUDIT_PATH = (
+    RESUME_ROOT
+    / "corrective-audits"
+    / "qwen35-27b-smoke-attempt-001-vram-audit.json"
+)
+LEGACY_SMOKE_ATTEMPT = (
+    STAGES_ROOT / "qwen35-27b-training-smoke-2step" / "attempt-001"
+)
 MODEL_8B = ROOT / "models" / "Qwen3-VL-8B-Instruct"
 MODEL_8B_REVISION = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 MODEL_27B = ROOT / "models" / "Qwen3.5-27B"
@@ -838,6 +849,7 @@ def _source_hashes() -> dict[str, str]:
             (ROOT / "src" / "snuaichal" / name).resolve()
             for name in (
                 "training.py",
+                "physical_memory.py",
                 "augmentation.py",
                 "modeling.py",
                 "scheduling.py",
@@ -1392,13 +1404,12 @@ def cuda_compute_processes() -> list[dict[str, Any]]:
 
 
 def assert_no_foreign_cuda_processes() -> None:
-    """Reject likely ML compute owners before launching another CUDA child."""
-    markers = ("python", "torch", "train", "infer", "ollama", "llama", "vllm")
+    """Reject credible ML compute owners while ignoring WDDM GUI process noise."""
     conflicts = [
-        record
+        identity
         for record in cuda_compute_processes()
         if record.get("pid") != os.getpid()
-        and any(marker in str(record.get("process_name", "")).lower() for marker in markers)
+        if (identity := cuda_workload_identity(int(record["pid"]))) is not None
     ]
     if conflicts:
         raise RuntimeError(f"foreign CUDA compute process(es) detected: {conflicts}")
@@ -1874,11 +1885,19 @@ def training_validator(
     *,
     resume_from_checkpoint: Path | None = None,
 ) -> Validator:
+    expected_resume_identity = (
+        _path_identity(resume_from_checkpoint)
+        if resume_from_checkpoint is not None
+        else None
+    )
+
     def validate(attempt: Path) -> list[str]:
         output = attempt / "training"
         checkpoint = output / f"checkpoint-{expected_step}"
         required = [
+            attempt / "pid.txt",
             output / "training_summary.json",
+            output / "physical_memory_measurement.json",
             output / "model_manifest.json",
             output / "schedule.json",
             output / "final" / "adapter_config.json",
@@ -1889,6 +1908,7 @@ def training_validator(
             checkpoint / "optimizer.pt",
             checkpoint / "scheduler.pt",
             checkpoint / "rng_state.pth",
+            checkpoint / "training_args.bin",
         ]
         errors = [
             f"missing or empty {path}"
@@ -1897,6 +1917,7 @@ def training_validator(
         ]
         try:
             summary = load_json(output / "training_summary.json")
+            physical = load_json(output / "physical_memory_measurement.json")
             manifest = load_json(output / "model_manifest.json")
             schedule = load_json(output / "schedule.json")
             trainer_state = load_json(checkpoint / "trainer_state.json")
@@ -1915,14 +1936,158 @@ def training_validator(
                 "train_runtime_seconds": True,
                 "train_steps_per_second": True,
                 "seconds_per_optimizer_step": True,
-                "peak_vram_bytes": True,
+                "initial_global_step": False,
+                "optimizer_steps_this_run": True,
+                "logical_peak_allocated_bytes": False,
+                "logical_peak_reserved_bytes": False,
             }
             for field, positive in numeric_rules.items():
                 if not _finite_number(summary.get(field), positive=positive):
-                    errors.append(f"{field} must be finite and {'positive' if positive else 'non-negative'}")
-            peak_vram = summary.get("peak_vram_bytes")
-            if _finite_number(peak_vram, positive=True) and float(peak_vram) > PHYSICAL_VRAM_BYTES:
-                errors.append(f"peak_vram_bytes={peak_vram!r} exceeds physical VRAM")
+                    errors.append(
+                        f"{field} must be finite and "
+                        f"{'positive' if positive else 'non-negative'}"
+                    )
+            if summary.get("memory_schema_version") != 3:
+                errors.append("memory schema version is not 3")
+            allocated = summary.get("logical_peak_allocated_bytes")
+            reserved = summary.get("logical_peak_reserved_bytes")
+            if not _finite_number(allocated, positive=False, integer=True):
+                errors.append("logical peak allocated bytes must be a non-negative integer")
+            if not _finite_number(reserved, positive=False, integer=True):
+                errors.append("logical peak reserved bytes must be a non-negative integer")
+            if (
+                _finite_number(allocated, positive=False)
+                and _finite_number(reserved, positive=False)
+                and float(allocated) > float(reserved)
+            ):
+                errors.append("logical peak allocated bytes exceeds logical peak reserved bytes")
+            if summary.get("allocator_memory_semantics") != ALLOCATOR_MEMORY_SEMANTICS:
+                errors.append("allocator memory semantics are missing or incorrect")
+            if not isinstance(summary.get("allocator_backend"), str) or not str(
+                summary.get("allocator_backend", "")
+            ).strip():
+                errors.append("allocator_backend must be a non-empty string")
+            if physical.get("schema_version") != 1:
+                errors.append("physical monitor schema version is not 1")
+            trusted_identity = summary.get("trusted_process_identity")
+            try:
+                launched_pid = int((attempt / "pid.txt").read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                launched_pid = None
+                errors.append("launched child PID record is invalid")
+            if not isinstance(trusted_identity, dict):
+                errors.append("trusted process identity is missing")
+            else:
+                trusted_pid = trusted_identity.get("pid")
+                create_time = trusted_identity.get("create_time")
+                command_digest = trusted_identity.get("command_identity")
+                if (
+                    isinstance(trusted_pid, bool)
+                    or not isinstance(trusted_pid, int)
+                    or trusted_pid <= 0
+                    or trusted_pid != launched_pid
+                ):
+                    errors.append("monitor PID differs from the launched CUDA child")
+                if not _finite_number(create_time, positive=True):
+                    errors.append("monitor create-time identity is invalid")
+                if (
+                    not isinstance(command_digest, str)
+                    or len(command_digest) != 64
+                    or any(character not in "0123456789abcdef" for character in command_digest)
+                ):
+                    errors.append("monitor command identity is not a SHA-256 digest")
+            for key, value in physical.items():
+                if key != "schema_version" and summary.get(key) != value:
+                    errors.append(f"physical monitor field {key} differs from summary")
+            interval = summary.get("sample_interval_seconds")
+            if (
+                not _finite_number(interval, positive=True)
+                or float(interval) > 1.0
+            ):
+                errors.append("physical sample interval must be in (0, 1] seconds")
+            parsed_timestamps: list[datetime] = []
+            for timestamp_field in ("sampling_started_at", "sampling_ended_at"):
+                try:
+                    parsed = datetime.fromisoformat(str(summary.get(timestamp_field)))
+                    if parsed.tzinfo is None:
+                        raise ValueError("timezone missing")
+                    parsed_timestamps.append(parsed)
+                except (TypeError, ValueError):
+                    errors.append(f"{timestamp_field} must be a timezone-aware timestamp")
+            if (
+                len(parsed_timestamps) == 2
+                and parsed_timestamps[1] < parsed_timestamps[0]
+            ):
+                errors.append("physical sampling ended before it started")
+            if summary.get("sampling_started_before_model_load") is not True:
+                errors.append("physical sampling did not start before model loading")
+            if summary.get("sampling_finished_after_work") is not True:
+                errors.append("physical sampling did not cover the end of child work")
+
+            measurement_status = summary.get("physical_measurement_status")
+            observed = summary.get("physical_peak_observed_bytes")
+            physical_total = summary.get("physical_total_vram_bytes")
+            source = summary.get("physical_measurement_source")
+            sample_count = summary.get("sample_count")
+            if measurement_status == "valid":
+                for field, value, positive in (
+                    ("physical_total_vram_bytes", physical_total, True),
+                    ("physical_peak_observed_bytes", observed, False),
+                    ("sample_count", sample_count, True),
+                ):
+                    if not _finite_number(value, positive=positive, integer=True):
+                        errors.append(f"{field} must be an integer with valid bounds")
+                if (
+                    _finite_number(observed, positive=False)
+                    and _finite_number(physical_total, positive=True)
+                    and float(observed) > float(physical_total)
+                ):
+                    errors.append("observed physical peak exceeds physical total VRAM")
+                if source not in {
+                    "nvml_per_process_used_bytes",
+                    "nvml_device_memory_info_used",
+                }:
+                    errors.append("physical measurement source is invalid")
+                if summary.get("continuation_gate_source") != source:
+                    errors.append("continuation gate does not use the selected physical source")
+                if summary.get("continuation_gate_bytes") != observed:
+                    errors.append("continuation gate bytes differ from physical peak")
+                if summary.get("process_identity_match") is not True:
+                    errors.append("trusted CUDA child identity did not match")
+                if summary.get("trusted_cuda_child_seen") is not True:
+                    errors.append("trusted CUDA child was not observed")
+                unexpected = summary.get("unexpected_cuda_processes")
+                if not isinstance(unexpected, list) or unexpected:
+                    errors.append("unexpected CUDA process invalidates physical measurement")
+                if source == "nvml_per_process_used_bytes":
+                    if not _finite_number(
+                        summary.get("process_sample_count"),
+                        positive=True,
+                        integer=True,
+                    ):
+                        errors.append("per-process source has zero valid samples")
+                elif source == "nvml_device_memory_info_used":
+                    if summary.get("process_memory_unavailable") is not True:
+                        errors.append("device fallback used while process memory was available")
+                    if summary.get("device_fallback_exclusive") is not True:
+                        errors.append("device fallback workload exclusivity is unproven")
+                    if not _finite_number(
+                        summary.get("device_sample_count"),
+                        positive=True,
+                        integer=True,
+                    ):
+                        errors.append("device fallback has zero valid samples")
+            elif measurement_status == "indeterminate":
+                if observed is not None or source is not None or sample_count != 0:
+                    errors.append("indeterminate measurement selected physical evidence")
+                if summary.get("continuation_gate_source") is not None:
+                    errors.append("indeterminate measurement selected a gate source")
+                if summary.get("continuation_gate_bytes") is not None:
+                    errors.append("indeterminate measurement selected gate bytes")
+                if not str(summary.get("physical_measurement_reason", "")).strip():
+                    errors.append("indeterminate measurement requires a reason")
+            else:
+                errors.append("physical measurement status is invalid")
             steps_per_second = summary.get("train_steps_per_second")
             seconds_per_step = summary.get("seconds_per_optimizer_step")
             if _finite_number(steps_per_second, positive=True) and _finite_number(
@@ -1933,6 +2098,30 @@ def training_validator(
                 rel_tol=0.02,
             ):
                 errors.append("step timing metrics are internally inconsistent")
+            expected_initial_step = 0
+            if resume_from_checkpoint is not None:
+                expected_initial_step = int(
+                    load_json(resume_from_checkpoint / "trainer_state.json")[
+                        "global_step"
+                    ]
+                )
+            completed_steps = expected_step - expected_initial_step
+            if summary.get("initial_global_step") != expected_initial_step:
+                errors.append("training did not begin at the required checkpoint step")
+            if summary.get("optimizer_steps_this_run") != completed_steps:
+                errors.append("optimizer step delta does not prove exact continuation")
+            runtime = summary.get("train_runtime_seconds")
+            if (
+                _finite_number(runtime, positive=True)
+                and _finite_number(seconds_per_step, positive=True)
+                and completed_steps > 0
+                and not math.isclose(
+                    float(seconds_per_step),
+                    float(runtime) / completed_steps,
+                    rel_tol=0.02,
+                )
+            ):
+                errors.append("seconds per optimizer step uses the wrong step count")
             trainable = manifest.get("trainable_parameters")
             total = manifest.get("total_parameters")
             if not _finite_number(trainable, positive=True, integer=True):
@@ -1952,18 +2141,92 @@ def training_validator(
             if resume_from_checkpoint is not None:
                 source_state = load_json(resume_from_checkpoint / "trainer_state.json")
                 source_step = source_state.get("global_step")
-                if (
+                source_required = [
+                    resume_from_checkpoint / "adapter_config.json",
+                    resume_from_checkpoint / "adapter_model.safetensors",
+                    resume_from_checkpoint / "optimizer.pt",
+                    resume_from_checkpoint / "scheduler.pt",
+                    resume_from_checkpoint / "rng_state.pth",
+                    resume_from_checkpoint / "training_args.bin",
+                ]
+                if any(
+                    not path.is_file() or path.stat().st_size <= 0
+                    for path in source_required
+                ):
+                    errors.append("resume checkpoint is missing required state artifacts")
+                if expected_step == 3:
+                    if source_step != 2 or resume_from_checkpoint.name != "checkpoint-2":
+                        errors.append("step-3 continuation must start from exact checkpoint-2")
+                elif (
                     not isinstance(source_step, int)
                     or source_step <= 0
                     or source_step >= expected_step
                     or resume_from_checkpoint.name != f"checkpoint-{source_step}"
                 ):
                     errors.append("resume checkpoint trainer_state/step is invalid")
+                if (
+                    expected_resume_identity is None
+                    or _path_identity(resume_from_checkpoint) != expected_resume_identity
+                ):
+                    errors.append("resume checkpoint identity changed during continuation")
         except Exception as exc:
             errors.append(f"training metadata invalid: {exc}")
         return errors
 
     return validate
+
+
+def validated_legacy_smoke_attempt() -> Path:
+    """Reuse only the immutable execution-valid, measurement-indeterminate smoke."""
+    audit = load_json(CORRECTIVE_AUDIT_PATH)
+    attempt = LEGACY_SMOKE_ATTEMPT
+    if audit.get("source_attempt", {}).get("path") != _project_path(attempt):
+        raise RuntimeError("corrective audit source attempt mismatch")
+    expected_manifest = audit.get("source_attempt", {}).get(
+        "artifact_manifest_sha256"
+    )
+    manifest_errors = _validate_attempt_artifact_manifest(
+        attempt, expected_sha256=expected_manifest
+    )
+    if manifest_errors:
+        raise RuntimeError(f"legacy smoke artifact integrity failed: {manifest_errors}")
+    if (attempt / "exit-code.txt").read_text(encoding="utf-8").strip() != "0":
+        raise RuntimeError("legacy smoke execution did not exit successfully")
+    summary = load_json(attempt / "training" / "training_summary.json")
+    checkpoint = attempt / "training" / "checkpoint-2"
+    state = load_json(checkpoint / "trainer_state.json")
+    if summary.get("global_step") != 2 or state.get("global_step") != 2:
+        raise RuntimeError("legacy smoke did not complete exact optimizer step 2")
+    source = audit.get("source_attempt", {})
+    expected_hashes = {
+        attempt / "provenance.json": source.get("provenance_sha256"),
+        attempt / "training" / "training_summary.json": source.get(
+            "training_summary_sha256"
+        ),
+        checkpoint / "adapter_model.safetensors": source.get(
+            "checkpoint_2_adapter_sha256"
+        ),
+        checkpoint / "trainer_state.json": source.get(
+            "checkpoint_2_trainer_state_sha256"
+        ),
+    }
+    for path, expected_sha256 in expected_hashes.items():
+        if not path.is_file() or sha256_file(path) != expected_sha256:
+            raise RuntimeError(f"legacy source identity mismatch: {_project_path(path)}")
+    outcomes = audit.get("outcomes", {})
+    reconstruction = audit.get("reconstruction", {})
+    if (
+        outcomes.get("training_execution") != "succeeded"
+        or outcomes.get("checkpoint_creation") != "succeeded"
+        or outcomes.get("artifact_integrity") != "succeeded"
+        or outcomes.get("vram_measurement_validation") != "failed"
+        or outcomes.get("overall_continuation_gate") != "pending_correction"
+        or reconstruction.get("classification")
+        != "execution_succeeded_measurement_indeterminate"
+        or reconstruction.get("precise_corrected_peak_reconstructable") is not False
+    ):
+        raise RuntimeError("corrective audit outcome is invalid")
+    return attempt
 
 
 def _terminal_record_for_attempt(attempt_dir: Path) -> dict[str, Any] | None:
@@ -2326,7 +2589,12 @@ def training_provenance_context(
         "expected_output_schema": {
             "global_step": expected_step,
             "complete_checkpoint": f"checkpoint-{expected_step}",
-            "training_summary_schema": 2,
+            "training_summary_schema": 3,
+            "physical_memory_schema": 1,
+            "physical_gate_sources": [
+                "nvml_per_process_used_bytes",
+                "nvml_device_memory_info_used",
+            ],
             "model_manifest_required": True,
         },
         "resume_compatibility_key": compatibility_key,
@@ -2567,24 +2835,12 @@ def run(*, poll_seconds: float) -> dict[str, Any]:
         seed=42,
         validation_fraction=0.10,
     )
-    smoke_attempt = run_stage(
-        "qwen35-27b-training-smoke-2step",
-        training_command(stop_after_steps=2, save_steps=2, limit=48),
-        validator=training_validator(2),
-        poll_seconds=poll_seconds,
-        provenance_context=training_provenance_context(
-            expected_step=2,
-            limit=48,
-            resume_from_checkpoint=None,
-            training_inputs=smoke_training_inputs,
-            model_spec=model_27b_spec,
-        ),
-        uses_cuda=True,
-    )
+    smoke_attempt = validated_legacy_smoke_attempt()
     smoke_output = smoke_attempt / "training"
-    smoke_adapter = smoke_output / "final"
+    smoke_checkpoint = smoke_output / "checkpoint-2"
+    smoke_adapter = smoke_checkpoint
     reload_attempt = run_stage(
-        "qwen35-27b-adapter-reload-inference-1row",
+        "qwen35-27b-checkpoint2-adapter-reload-inference-1row-corrected",
         build_inference_command(
             model_path=MODEL_27B,
             adapter_path=smoke_adapter,
@@ -2623,9 +2879,8 @@ def run(*, poll_seconds: float) -> dict[str, Any]:
         ),
         uses_cuda=True,
     )
-    smoke_checkpoint = smoke_output / "checkpoint-2"
     resume_attempt = run_stage(
-        "qwen35-27b-resume-probe-step3",
+        "qwen35-27b-checkpoint2-continuation-step3-corrected",
         training_command(
             stop_after_steps=3,
             save_steps=3,
@@ -2647,16 +2902,23 @@ def run(*, poll_seconds: float) -> dict[str, Any]:
         uses_cuda=True,
     )
 
-    smoke_summary = load_json(smoke_output / "training_summary.json")
     smoke_manifest = load_json(smoke_output / "model_manifest.json")
-    seconds_per_step = float(smoke_summary["seconds_per_optimizer_step"])
+    resume_summary = load_json(resume_attempt / "training" / "training_summary.json")
+    seconds_per_step = float(resume_summary["seconds_per_optimizer_step"])
     projected_seconds = seconds_per_step * FULL_OPTIMIZER_STEPS
     package_bytes = directory_size(MODEL_27B) + directory_size(smoke_output / "final")
+    physical_valid = resume_summary.get("physical_measurement_status") == "valid"
+    physical_peak = resume_summary.get("physical_peak_observed_bytes")
     smoke_report = {
         "download_attempt": str(download_attempt),
         "training_attempt": str(smoke_attempt),
-        "loss": smoke_summary["training_loss"],
-        "peak_vram_bytes": smoke_summary["peak_vram_bytes"],
+        "legacy_training_execution": "succeeded",
+        "legacy_physical_measurement": "indeterminate",
+        "loss": resume_summary["training_loss"],
+        "physical_peak_observed_bytes": physical_peak,
+        "physical_measurement_source": resume_summary.get(
+            "physical_measurement_source"
+        ),
         "seconds_per_optimizer_step": seconds_per_step,
         "trainable_parameters": smoke_manifest["trainable_parameters"],
         "adapter_reload_success": True,
@@ -2667,7 +2929,11 @@ def run(*, poll_seconds: float) -> dict[str, Any]:
         "projected_full_training_seconds": projected_seconds,
         "projected_full_training_hours": projected_seconds / 3600,
         "projected_package_bytes": package_bytes,
-        "vram_safe": smoke_summary["peak_vram_bytes"] <= MAX_SAFE_VRAM_BYTES,
+        "vram_safe": (
+            physical_valid
+            and isinstance(physical_peak, int)
+            and physical_peak <= MAX_SAFE_VRAM_BYTES
+        ),
         "runtime_acceptable": projected_seconds <= MAX_PROJECTED_HOURS * 3600,
         "package_under_80gb": package_bytes <= MAX_PACKAGE_BYTES,
     }

@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import argparse
 import ast
+import atexit
 import csv
 import itertools
 import json
+import os
 import random
+import subprocess
+import sys
+import time
 from collections import Counter
+from datetime import datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Callable
@@ -16,6 +22,7 @@ from typing import Any, Callable
 from snuaichal.augmentation import DatasetEpochCallback, EpochShuffleDataset
 from snuaichal.inference import build_messages
 from snuaichal.modeling import ModelFamily, apply_model_chat_template
+from snuaichal.physical_memory import command_identity
 from snuaichal.scheduling import (
     HorizonTrainer,
     StopAtStepCallback,
@@ -487,36 +494,215 @@ def build_training_argument_kwargs(
     }
 
 
+ALLOCATOR_MEMORY_SEMANTICS = (
+    "PyTorch CUDA allocator accounting; allocated is contained in reserved, and either "
+    "may exceed dedicated physical residency under pageable/WDDM execution"
+)
+
+
+def _non_negative_int(name: str, value: Any, *, positive: bool = False) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    if value < (1 if positive else 0):
+        qualifier = "positive" if positive else "non-negative"
+        raise ValueError(f"{name} must be {qualifier}")
+    return value
+
+
+def build_vram_measurements(
+    *,
+    logical_peak_allocated_bytes: int,
+    logical_peak_reserved_bytes: int,
+    allocator_backend: str,
+    physical_measurement: dict[str, Any],
+) -> dict[str, Any]:
+    """Combine logical allocator diagnostics with one external physical measurement."""
+    allocated = _non_negative_int(
+        "logical_peak_allocated_bytes", logical_peak_allocated_bytes
+    )
+    reserved = _non_negative_int(
+        "logical_peak_reserved_bytes", logical_peak_reserved_bytes
+    )
+    if allocated > reserved:
+        raise ValueError(
+            "logical peak allocated bytes cannot exceed logical peak reserved bytes"
+        )
+    if not isinstance(allocator_backend, str) or not allocator_backend.strip():
+        raise ValueError("allocator_backend must be non-empty")
+    status = physical_measurement.get("physical_measurement_status")
+    if status not in {"valid", "indeterminate"}:
+        raise ValueError("physical measurement status is invalid")
+    result = {
+        "memory_schema_version": 3,
+        "logical_peak_allocated_bytes": allocated,
+        "logical_peak_reserved_bytes": reserved,
+        "allocator_backend": allocator_backend,
+        "allocator_memory_semantics": ALLOCATOR_MEMORY_SEMANTICS,
+        **physical_measurement,
+    }
+    if status == "valid":
+        total = _non_negative_int(
+            "physical_total_vram_bytes",
+            result.get("physical_total_vram_bytes"),
+            positive=True,
+        )
+        observed = _non_negative_int(
+            "physical_peak_observed_bytes",
+            result.get("physical_peak_observed_bytes"),
+        )
+        samples = _non_negative_int(
+            "sample_count", result.get("sample_count"), positive=True
+        )
+        source = result.get("physical_measurement_source")
+        if source not in {
+            "nvml_per_process_used_bytes",
+            "nvml_device_memory_info_used",
+        }:
+            raise ValueError("physical measurement source is invalid")
+        if observed > total:
+            raise ValueError("physical peak exceeds physical total VRAM")
+        result["physical_total_vram_bytes"] = total
+        result["physical_peak_observed_bytes"] = observed
+        result["sample_count"] = samples
+        result["continuation_gate_source"] = source
+        result["continuation_gate_bytes"] = observed
+    else:
+        if result.get("physical_peak_observed_bytes") is not None:
+            raise ValueError("indeterminate physical measurement cannot have a peak")
+        if result.get("physical_measurement_source") is not None:
+            raise ValueError("indeterminate physical measurement cannot select a source")
+        if result.get("sample_count") != 0:
+            raise ValueError("indeterminate physical measurement must select zero samples")
+        if not str(result.get("physical_measurement_reason", "")).strip():
+            raise ValueError("indeterminate physical measurement requires a reason")
+        result["continuation_gate_source"] = None
+        result["continuation_gate_bytes"] = None
+    return result
+
+
+class ExternalPhysicalMemoryMonitor:
+    """Run the narrow NVML sampler before model load and finalize it after work."""
+
+    def __init__(self, output_dir: Path, *, interval_seconds: float = 0.5) -> None:
+        self.output_dir = output_dir
+        self.interval_seconds = interval_seconds
+        self.ready_path = output_dir / ".physical-monitor-ready"
+        self.done_path = output_dir / ".physical-monitor-done"
+        self.report_path = output_dir / "physical_memory_measurement.json"
+        self.process: subprocess.Popen[bytes] | None = None
+        self._closed = False
+
+    def start(self) -> None:
+        import psutil
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        parent = psutil.Process(os.getpid())
+        command = [
+            sys.executable,
+            "-m",
+            "snuaichal.physical_memory",
+            "--parent-pid",
+            str(os.getpid()),
+            "--expected-create-time",
+            str(parent.create_time()),
+            "--expected-command-identity",
+            command_identity(parent.cmdline()),
+            "--ready-path",
+            str(self.ready_path),
+            "--done-path",
+            str(self.done_path),
+            "--report-path",
+            str(self.report_path),
+            "--sample-interval-seconds",
+            str(self.interval_seconds),
+        ]
+        self.process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
+        )
+        deadline = time.monotonic() + 15.0
+        while not self.ready_path.is_file():
+            if self.process.poll() is not None or time.monotonic() >= deadline:
+                raise RuntimeError("physical memory monitor did not become ready")
+            time.sleep(0.05)
+        atexit.register(self.close)
+
+    def close(self) -> dict[str, Any]:
+        if self._closed:
+            return json.loads(self.report_path.read_text(encoding="utf-8"))
+        self._closed = True
+        self.done_path.write_text(
+            datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8"
+        )
+        if self.process is not None:
+            try:
+                self.process.wait(timeout=max(15.0, self.interval_seconds * 10))
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+        deadline = time.monotonic() + 5.0
+        while not self.report_path.is_file() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        try:
+            atexit.unregister(self.close)
+        except Exception:
+            pass
+        if not self.report_path.is_file():
+            raise RuntimeError("physical memory monitor report is missing")
+        return json.loads(self.report_path.read_text(encoding="utf-8"))
+
+
 def build_training_summary(
     *,
     global_step: int,
     epoch: float | None,
     learning_rate: float,
     training_loss: float,
-    peak_vram_bytes: int,
     train_metrics: dict[str, Any],
+    initial_global_step: int = 0,
+    vram_measurements: dict[str, Any] | None = None,
+    peak_vram_bytes: int | None = None,
 ) -> dict[str, Any]:
-    """Build an auditable training summary including optimizer-step timing."""
-    steps_per_second = train_metrics.get("train_steps_per_second")
-    steps_per_second = (
-        float(steps_per_second) if steps_per_second is not None else None
+    """Build an auditable training summary including invocation-local step timing."""
+    if vram_measurements is None:
+        if peak_vram_bytes is None:
+            raise ValueError("VRAM measurements are required")
+        # Compatibility for callers that only build legacy summaries in unit tests.
+        vram_measurements = {"peak_vram_bytes": int(peak_vram_bytes)}
+    final_global_step = int(global_step)
+    initial_step = int(initial_global_step)
+    optimizer_steps_this_run = final_global_step - initial_step
+    if initial_step < 0 or optimizer_steps_this_run <= 0:
+        raise ValueError("training summary requires a positive invocation-local step delta")
+    runtime = (
+        float(train_metrics["train_runtime"])
+        if train_metrics.get("train_runtime") is not None
+        else None
     )
-    return {
-        "global_step": int(global_step),
+    steps_per_second = (
+        optimizer_steps_this_run / runtime
+        if runtime is not None and runtime > 0
+        else None
+    )
+    summary = {
+        "global_step": final_global_step,
+        "initial_global_step": initial_step,
+        "optimizer_steps_this_run": optimizer_steps_this_run,
         "epoch": epoch,
         "learning_rate": float(learning_rate),
         "training_loss": float(training_loss),
-        "peak_vram_bytes": int(peak_vram_bytes),
-        "train_runtime_seconds": (
-            float(train_metrics["train_runtime"])
-            if train_metrics.get("train_runtime") is not None
-            else None
-        ),
+        "train_runtime_seconds": runtime,
         "train_steps_per_second": steps_per_second,
         "seconds_per_optimizer_step": (
-            1.0 / steps_per_second if steps_per_second and steps_per_second > 0 else None
+            runtime / optimizer_steps_this_run
+            if runtime is not None and runtime > 0
+            else None
         ),
     }
+    summary.update(vram_measurements)
+    return summary
 
 
 def run(args: argparse.Namespace) -> None:
@@ -623,6 +809,11 @@ def run(args: argparse.Namespace) -> None:
         },
     )
 
+    physical_monitor = ExternalPhysicalMemoryMonitor(
+        args.output_dir, interval_seconds=0.5
+    )
+    physical_monitor.start()
+
     bf16 = torch.cuda.is_bf16_supported()
     dtype = torch.bfloat16 if bf16 else torch.float16
     config = AutoConfig.from_pretrained(args.model_path, local_files_only=True)
@@ -717,27 +908,43 @@ def run(args: argparse.Namespace) -> None:
         ],
         scheduler_horizon_steps=schedule.scheduler_horizon_steps,
     )
+    initial_global_step = 0
+    if args.resume_from_checkpoint is not None:
+        source_state = json.loads(
+            (args.resume_from_checkpoint / "trainer_state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        initial_global_step = int(source_state["global_step"])
     torch.cuda.reset_peak_memory_stats()
     train_result = trainer.train(
         resume_from_checkpoint=(
             str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None
         )
     )
+    final_dir = args.output_dir / "final"
+    trainer.save_model(final_dir)
+    processor.save_pretrained(final_dir)
+    physical_measurement = physical_monitor.close()
+    vram_measurements = build_vram_measurements(
+        logical_peak_allocated_bytes=int(torch.cuda.max_memory_allocated()),
+        logical_peak_reserved_bytes=int(torch.cuda.max_memory_reserved()),
+        allocator_backend=torch.cuda.get_allocator_backend(),
+        physical_measurement=physical_measurement,
+    )
     summary = build_training_summary(
         global_step=trainer.state.global_step,
+        initial_global_step=initial_global_step,
         epoch=trainer.state.epoch,
         learning_rate=trainer._get_learning_rate(),
         training_loss=train_result.training_loss,
-        peak_vram_bytes=torch.cuda.max_memory_allocated(),
         train_metrics=train_result.metrics,
+        vram_measurements=vram_measurements,
     )
     (args.output_dir / "training_summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     print(json.dumps(summary, sort_keys=True))
-    final_dir = args.output_dir / "final"
-    trainer.save_model(final_dir)
-    processor.save_pretrained(final_dir)
 
 
 def main() -> None:
