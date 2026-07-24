@@ -58,3 +58,52 @@
 - 산출물: `outputs/qwen3-vl-8b-smoke/`
 - 비고: 48행·2-step 기능 검증 결과로 모델 품질 비교에 사용하지 않음. 최초 TTA reload가 keyword-only canonicalization 호출 오류를 발견했고 회귀 테스트 추가 후 수정·재실행함.
 - 외부 API 호출 수/비용: 0 KRW
+
+## EXP-20260721-Q36-2726-FINAL
+
+- 상태: terminal checkpoint, adapter export, RTX 3090 full inference, Kaggle 제출 완료
+- 목적: full-data Qwen3.6-27B rank32 QLoRA와 canonical Latin4 hard vote 검증
+- 모델: `Qwen/Qwen3.6-27B`
+- revision: `6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`
+- model tree SHA-256:
+  `e4107e6508793261ca372faf4b560dcb55a5b6ba79a5ab921bfe1b25a207ec07`
+- 데이터: 공식 train 9,535행 전체, 외부 학습/튜닝 데이터 없음
+- train.csv SHA-256:
+  `9f728e4e2c052876f4cd3b2c0ccf8a8674ce43f5bcdee9a72f1eb8c6ed2b637e`
+- 학습: 3 epochs horizon, step 2726 stop, LR 1e-4, cosine, warmup 0.03,
+  weight decay 0.01, batch 1, accumulation 8, rank/alpha 32/32,
+  dropout 0.05, save 537, seed/data_seed 42, paged AdamW 8-bit
+- 학습 장비: RunPod NVIDIA RTX A6000; 표시 단가 USD 0.53/hour
+- 학습 physical peak: 약 43.793 GiB
+- terminal training loss: 0.09329
+- adapter tensors: 512, 모두 finite
+- adapter SHA-256:
+  `189f6c1be09bce1a9b71afeb4807b255b4c144fd2ddfc495ba0109d08ca9f1f6`
+- Release archive SHA-256:
+  `f89df01d00d3b4808881abd2abb2d48df35213c1b1506dd856ac66c62cd5a054`
+- 추론: RTX 3090, NF4/BF16, SDPA, 512², Latin4, max tokens 64,
+  hard majority, lexicographic tie
+- 추론 결과: 819행/3,276 views, parse failure 0
+- generation loop: 16.4693초/row, 환산 약 3시간 45분
+- end-to-end wall clock: 13,990.456초, 약 3시간 53분
+- inference physical peak: 22,710,861,824 bytes, 약 21.15 GiB
+- final CSV SHA-256:
+  `75c4c223cd73f01e801753610bbee46e2e6b5cdb0166378b9af71ee9e29b7563`
+- Public score: 0.93542
+- 외부 상용 API 호출/비용: 0회 / 0 KRW
+- 비용 주의: RunPod 전체 연구비는 provider billing receipt가 저장소에 없어
+  USD 확정 총액을 발명하지 않음
+- 근거: `docs/final_results.json`, final adapter manifest, five-page report
+
+## EXP-20260724-FINAL-SELECTION
+
+- 목적: checkpoint/view/aggregation 후보 중 외부 평가용 단일 시스템 고정
+- ckpt2726 Latin4 confidence: 0.92670
+- ckpt2726 Latin4 hard: 0.93542, 4 views
+- ckpt2726 TTA24 hard: 0.93193, 24 views
+- ckpt3400 TTA12 hard: 0.93542, 12 views
+- 선택: ckpt2726 Latin4 hard
+- 규칙: 관측 Public 동점 후보에서 더 이른 checkpoint와 더 적은 view를 선택
+- 한계: ckpt2726-vs-3400은 checkpoint와 view 수가 함께 달라 순수 causal
+  checkpoint ablation이 아님
+- 외부 평가: 이 선택을 사전 freeze하고 별도 학습·튜닝 없이 exactly once 추론

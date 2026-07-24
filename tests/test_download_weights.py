@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
 
-from scripts.download_weights import safe_relative_path, verify_snapshot
+from scripts.download_weights import (
+    canonical_json,
+    load_manifest,
+    safe_relative_path,
+    verify_snapshot,
+)
 
 
 def record(path: str, content: bytes) -> dict[str, object]:
@@ -27,6 +33,26 @@ def test_verify_snapshot_accepts_exact_inventory(tmp_path: Path) -> None:
     result = verify_snapshot(tmp_path, manifest)
     assert result["status"] == "PASS"
     assert result["verified_files"] == 1
+
+
+def test_load_manifest_verifies_its_self_hash(tmp_path: Path) -> None:
+    manifest = {
+        "repository": "example/model",
+        "revision": "a" * 40,
+        "files": [record("model.safetensors", b"weights")],
+    }
+    manifest["manifest_sha256"] = hashlib.sha256(
+        canonical_json(manifest).encode()
+    ).hexdigest()
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert load_manifest(path)["repository"] == "example/model"
+
+    manifest["revision"] = "b" * 40
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="self SHA-256"):
+        load_manifest(path)
 
 
 def test_verify_snapshot_accepts_and_validates_local_revision_marker(tmp_path: Path) -> None:

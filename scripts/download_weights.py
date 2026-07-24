@@ -14,12 +14,20 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def canonical_json(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
 def load_manifest(path: Path) -> dict[str, object]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    required = {"repository", "revision", "files"}
+    required = {"repository", "revision", "files", "manifest_sha256"}
     missing = sorted(required - payload.keys())
     if missing:
         raise RuntimeError(f"weight manifest missing fields: {missing}")
+    unsigned = {key: value for key, value in payload.items() if key != "manifest_sha256"}
+    actual = hashlib.sha256(canonical_json(unsigned).encode()).hexdigest()
+    if payload["manifest_sha256"] != actual:
+        raise RuntimeError("weight manifest self SHA-256 mismatch")
     if not isinstance(payload["files"], list) or not payload["files"]:
         raise RuntimeError("weight manifest files must be a non-empty list")
     return payload

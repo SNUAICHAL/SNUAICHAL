@@ -15,6 +15,28 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
+def _nvml_handle_for_visible_device(pynvml: Any) -> Any:
+    """Resolve the one scheduler-visible device to its physical NVML handle."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        return pynvml.nvmlDeviceGetHandleByIndex(0)
+    devices = [item.strip() for item in visible.split(",") if item.strip()]
+    if len(devices) != 1:
+        raise RuntimeError("physical monitor requires one visible CUDA device")
+    device = devices[0]
+    if device.isdigit():
+        return pynvml.nvmlDeviceGetHandleByIndex(int(device))
+    if device.startswith(("GPU-", "MIG-")):
+        try:
+            return pynvml.nvmlDeviceGetHandleByUUID(device)
+        except TypeError:
+            return pynvml.nvmlDeviceGetHandleByUUID(device.encode("ascii"))
+    try:
+        return pynvml.nvmlDeviceGetHandleByPciBusId(device)
+    except TypeError:
+        return pynvml.nvmlDeviceGetHandleByPciBusId(device.encode("ascii"))
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -304,7 +326,7 @@ def monitor_process(
             raise RuntimeError("trusted parent identity mismatch before sampling")
         pynvml.nvmlInit()
         pynvml_initialized = True
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        handle = _nvml_handle_for_visible_device(pynvml)
         memory = pynvml.nvmlDeviceGetMemoryInfo(handle)
         physical_total = int(memory.total)
 

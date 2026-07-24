@@ -164,14 +164,16 @@
     "model-00014-of-00015.safetensors",
     "model-00015-of-00015.safetensors"
   ],
+  "license": "Apache-2.0",
   "local_model_path": "<portable>",
-  "manifest_sha256": "b1eebd2070e4f825bf02e05d437498703a11566d73340eb40e54e9e640346d07",
+  "manifest_sha256": "8bf7baa2efbf9e99a28a48b2531e3543e59b87a6f0163ceccc4dd7668b915dc1",
   "model_family": "qwen3_5",
   "model_index_identity": {
     "path": "model.safetensors.index.json",
     "sha256": "a8ad2c26fb707ff8c245806315b03e3b4b74595528492423af5dae0ce39b4d9b",
     "size_bytes": 112216
   },
+  "public_date": "2026-04-24",
   "repository": "Qwen/Qwen3.6-27B",
   "revision": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
   "schema_version": 1,
