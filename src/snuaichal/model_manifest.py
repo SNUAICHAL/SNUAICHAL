@@ -90,6 +90,36 @@ def _actual_model_files(model_root: Path) -> set[str]:
     return files
 
 
+def _verify_manifest_inventory(
+    model_root: Path, records: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Verify a portable manifest directly against regular local files."""
+    root = model_root.resolve()
+    verified: list[dict[str, Any]] = []
+    for record in records:
+        relative = _safe_relative(record.get("path"))
+        candidate = root / relative
+        if candidate.is_symlink():
+            raise ValueError(f"model file must not be a symlink: {relative}")
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(root)
+        except (FileNotFoundError, ValueError) as exc:
+            raise ValueError(f"model file missing or escapes root: {relative}") from exc
+        if not resolved.is_file():
+            raise ValueError(f"model path is not a regular file: {relative}")
+        size = resolved.stat().st_size
+        if size != record.get("size_bytes"):
+            raise ValueError(f"pinned size mismatch: {relative}")
+        sha256 = _sha256_file(resolved)
+        if sha256 != record.get("sha256"):
+            raise ValueError(f"pinned SHA-256 mismatch: {relative}")
+        verified.append(
+            {"path": relative, "size_bytes": size, "sha256": sha256}
+        )
+    return verified
+
+
 def _inventory_from_source_tree(
     model_root: Path, source_tree: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -259,14 +289,15 @@ def verify_model_manifest(
     expected_identity = {
         "repository": expected_repository,
         "revision": expected_revision,
-        "local_model_path": _normalized_root(model_root),
         "model_family": expected_family,
     }
     for key, expected in expected_identity.items():
         if manifest.get(key) != expected:
             raise ValueError(f"model manifest {key} mismatch")
+    recorded_root = manifest.get("local_model_path")
+    if recorded_root not in {"<portable>", _normalized_root(model_root)}:
+        raise ValueError("model manifest local_model_path mismatch")
     _verify_snapshot_marker(model_root, expected_repository, expected_revision)
-    source_tree = _source_tree(model_root, expected_revision)
 
     records = manifest.get("files")
     if not isinstance(records, list) or not records:
@@ -281,10 +312,24 @@ def verify_model_manifest(
     if set(normalized) != _actual_model_files(model_root):
         raise ValueError("local model contains missing or unlisted files")
 
-    pinned_inventory = _inventory_from_source_tree(model_root, source_tree)
-    if records != pinned_inventory:
-        raise ValueError("model manifest inventory differs from pinned source tree")
-    verified = pinned_inventory
+    source_tree_path = (
+        model_root
+        / ".cache"
+        / "huggingface"
+        / "trees"
+        / f"{expected_revision}.json"
+    )
+    if source_tree_path.is_file():
+        pinned_inventory = _inventory_from_source_tree(
+            model_root, _source_tree(model_root, expected_revision)
+        )
+        if records != pinned_inventory:
+            raise ValueError("model manifest inventory differs from pinned source tree")
+        verified = pinned_inventory
+    else:
+        # Clean Hugging Face downloads do not contain our acquisition-side tree
+        # receipt. The committed content-addressed manifest remains the trust root.
+        verified = _verify_manifest_inventory(model_root, records)
 
     index_identity, shards = _index_identity(model_root, verified)
     if manifest.get("model_index_identity") != index_identity:

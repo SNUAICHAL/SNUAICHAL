@@ -1,302 +1,280 @@
-# SNU AI Challenge 2026 baseline
+# SNU AI Challenge 2026 final solution
 
-> 텍스트로 풀어보는 장면의 재구성 — 단서를 활용해 4장의 이미지를 재구성하라
+문장과 뒤섞인 네 장의 프레임으로 원래 시간 순서를 복원하는 SNU AI Challenge
+2026 제출 시스템입니다. 최종 재현 대상은 **Qwen3.6-27B + checkpoint-2726
+QLoRA + canonical Latin4 hard vote**입니다.
 
-[SNU AI Challenge 2026](https://snuaichallenge.github.io/) 참가를 위한 재현 가능한
-베이스라인 저장소입니다. 주어진 문장(`Sentence`)과 뒤섞인 이미지 프레임 4장을
-바탕으로 원본 비디오의 시간 순서를 복원합니다.
+이 저장소는 다음을 한 번에 재현하도록 고정했습니다.
 
-운영진 제공 노트북의 `Qwen2-VL-2B-Instruct` zero-shot 베이스라인을 기반으로,
-학습과 추론 진입점을 분리하고 인터넷이 차단된 검증 환경에서도 로컬 가중치만으로
-실행할 수 있게 구성했습니다.
+- 공개일 제한 이전의 Qwen3.6-27B base snapshot을 revision과 파일 SHA-256으로 검증
+- checkpoint-2726 LoRA adapter를 GitHub Release에서 내려받아 SHA-256 검증
+- RTX 3090 24 GB 한 장에서 NF4/BF16 추론
+- 네 개의 균형 잡힌 cyclic view를 원래 입력 좌표로 되돌린 뒤 hard majority 집계
+- 819행 제출 CSV, raw-output audit, metrics receipt 생성
 
-- [공식 홈페이지](https://snuaichallenge.github.io/)
-- [참가 안내](https://snuaichallenge.github.io/participation/)
-- [대회 규칙](https://snuaichallenge.github.io/rules/)
-- [FAQ](https://snuaichallenge.github.io/faq/)
+최종 보고서는 [한국어 PDF](docs/final_report_5page_ko.pdf)와
+[원문 Markdown](docs/final_report_5page_ko.md)으로 제공합니다.
 
-대회는 Kaggle에서 진행되며, 참가 신청과 자격 확인 후 접근 권한이 부여됩니다.
+## 최종 결과와 선택
 
-## 과제와 평가
+| 모델·추론 | Public | 비용 | 최종 사용 |
+|---|---:|---:|---|
+| Qwen3.6-27B ckpt2726, Latin4 confidence | 0.92670 | 4 views | 아니오 |
+| **Qwen3.6-27B ckpt2726, Latin4 hard** | **0.93542** | **4 views** | **예** |
+| Qwen3.6-27B ckpt2726, TTA24 hard | 0.93193 | 24 views | 아니오 |
+| Qwen3.6-27B ckpt3400, TTA12 hard | 0.93542 | 12 views | 아니오 |
+| Qwen3.5-27B ckpt1073, Latin4 confidence | 0.92844 | 4 views | fallback |
 
-각 샘플에는 고유한 `Id`, 문장 하나, 뒤섞인 이미지 4장이 주어집니다. 답은 이미지
-번호를 시간순으로 나열하는 형식이 아니라, **입력된 각 이미지가 원본 영상에서 몇 번째
-위치인지** 나타내는 순열입니다.
+checkpoint-3400은 세 배의 추론 view와 더 긴 학습에도 checkpoint-2726을 넘지
+못했습니다. TTA24와 confidence tie-break도 각각 점수를 낮췄습니다. 따라서 동일
+최고점 중 가장 작고 빠르며 재현 가능한 checkpoint-2726 Latin4 hard를 최종
+시스템으로 선택했습니다.
+
+Public leaderboard는 test의 70%만 반영하므로 위 비교가 Private 또는 외부 데이터의
+우위를 보장하지는 않습니다. 이 한계를 숨기지 않고, 운영진의 외부 데이터 평가는
+아래의 단일 고정 모델과 코드로 수행합니다.
+
+## 최종 계약
+
+| 항목 | 고정값 |
+|---|---|
+| Base | `Qwen/Qwen3.6-27B` |
+| Revision | `6a9e13bd6fc8f0983b9b99948120bc37f49c13e9` |
+| Portable tree SHA-256 | `e4107e6508793261ca372faf4b560dcb55a5b6ba79a5ab921bfe1b25a207ec07` |
+| 학습 | 전체 9,535행, 2,726 optimizer steps, 2.28694 epochs |
+| Adapter | QLoRA rank 32 / alpha 32 / dropout 0.05 |
+| Adapter SHA-256 | `189f6c1be09bce1a9b71afeb4807b255b4c144fd2ddfc495ba0109d08ca9f1f6` |
+| Runtime | NF4, BF16 compute, SDPA, image size 512, batch 1 |
+| Generation | `max_new_tokens=64`, seed 42, thinking disabled |
+| Views | `1234`, `2341`, `3412`, `4123` |
+| Aggregation | original-slot canonicalization → hard majority → lexicographic tie |
+
+채점에 사용한 `inference.py`, prompt, parser, TTA와 aggregation 코드는 이후 점수에
+맞춰 다시 쓰지 않았습니다. 설정의 기계 판독본은
+[configs/final_inference.json](configs/final_inference.json)에 있습니다.
+
+## 요구 환경
+
+- Python 3.10
+- Linux 또는 Windows
+- NVIDIA RTX 3090 24 GB 이상
+- CUDA 12.4 호환 driver
+- 약 80 GB의 디스크 여유
+
+검증 환경:
 
 ```text
-원본 순서:       a, b, c, d
-입력 이미지:     a, d, b, c
-정답 Answer:    [1, 4, 2, 3]
+torch 2.6.0+cu124
+torchvision 0.21.0+cu124
+transformers 5.13.1
+accelerate 1.7.0
+peft 0.19.1
+bitsandbytes 0.48.2
+qwen-vl-utils 0.0.14
 ```
 
-- 평가 지표: Exact Match Accuracy
-- Public leaderboard: 전체 테스트 데이터의 70%
-- 한 위치라도 틀리면 해당 샘플 전체가 오답
-- 별도 validation 데이터는 없으므로 `train` 일부를 검증용으로 분리
-- 학습 데이터에는 모호하거나 텍스트와 무관한 프레임 등 정제되지 않은 샘플이 포함될 수 있음
+설치:
 
-데이터 원본이나 수정본을 재배포할 수 없으므로 이 저장소에는 데이터 파일을 포함하지
-않습니다. 자세한 내용은 공식 [Data](https://snuaichallenge.github.io/data/) 페이지를
-확인하세요. 저장소 공개 여부와 코드·가중치 공유 범위 역시 공식 Agreement 및 각 모델
-라이선스를 먼저 확인해야 합니다.
+```bash
+python3.10 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install torch==2.6.0 torchvision==0.21.0 \
+  --index-url https://download.pytorch.org/whl/cu124
+python -m pip install -r requirements.txt
+python -m pip install -e .
+```
 
-## 주요 일정
+Windows PowerShell에서는 활성화 명령만 다음으로 바꿉니다.
 
-| 일정 | 날짜 및 시간 |
-|---|---|
-| 참가 신청 | 2026-06-22 ~ 2026-07-17 |
-| 온라인 예선·제출 | 2026-06-29 10:00 ~ 2026-07-24 23:59 KST |
-| 최종 리더보드 | 2026-07-25 |
-| 상위팀 코드·보고서 제출 | 2026-07-25 ~ 2026-07-28 |
-| 본선 진출팀 발표 | 2026-08-03 |
-| 발표 자료 제출 마감 | 2026-08-06 |
-| 오프라인 본선 | 2026-08-07 예정 |
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
 
-일정은 변경될 수 있으므로 공식 [Timeline](https://snuaichallenge.github.io/timeline/)을
-우선합니다.
+## 데이터 배치
+
+대회 데이터는 재배포하지 않습니다. 운영진 데이터를 아래처럼 둡니다.
+
+```text
+data/
+├── test.csv
+├── test/
+│   └── <Id>/<image files>
+├── train.csv
+└── train/
+```
+
+`test.csv`는 `Id, Input_1, Input_2, Input_3, Input_4, Sentence` 열을 가져야
+합니다. 외부 데이터나 외부 상용 API를 학습·전처리·추론에 사용하지 않았습니다.
+
+## 가중치 준비
+
+### 1. Base model
+
+고정 manifest에는 29개 파일(15개 safetensors shard)의 크기와 SHA-256이 모두
+포함됩니다.
+
+```bash
+python -B scripts/download_weights.py \
+  --manifest configs/weights/qwen36-27b-final.manifest.json \
+  --output models/Qwen3.6-27B
+```
+
+이미 snapshot이 있다면 다운로드 없이 검증할 수 있습니다.
+
+```bash
+python -B scripts/download_weights.py \
+  --manifest configs/weights/qwen36-27b-final.manifest.json \
+  --output models/Qwen3.6-27B \
+  --verify-only
+```
+
+### 2. checkpoint-2726 adapter
+
+adapter는 GitHub Release asset으로 제공됩니다. downloader는 archive의
+591,369,852 bytes와 SHA-256
+`f89df01d00d3b4808881abd2abb2d48df35213c1b1506dd856ac66c62cd5a054`
+및 내부 두 파일을 모두 검증한 뒤 설치합니다.
+
+```bash
+python -B scripts/download_final_adapter.py \
+  --output weights/qwen36-checkpoint2726
+```
+
+수동 다운로드 시:
+
+```text
+https://github.com/SNUAICHAL/SNUAICHAL/releases/download/final-q36-2726-v1/q36-checkpoint2726-adapter.tar.gz
+```
+
+## 최종 추론
+
+다른 CUDA workload가 없는지 확인한 뒤 실행합니다.
+
+```bash
+python -B -m scripts.run_final_inference --data-dir data --resume
+```
+
+기본 출력:
+
+```text
+outputs/final-inference/
+├── submission.csv
+├── audit.jsonl
+└── metrics.json
+```
+
+`--resume`은 완전한 row audit만 재사용합니다. 최종 제출 전에는 다음을 확인합니다.
+
+```bash
+python -m pytest
+python -m ruff check src scripts tests
+```
+
+실측 checkpoint-2726 Latin4 run은 RTX 3090에서 다음과 같았습니다.
+
+- 819/819 rows, parse failure 0
+- 16.4693 seconds/row, 약 3시간 45분
+- physical peak VRAM 22,710,861,824 bytes(약 21.15 GiB)
+- Public score 0.93542
+
+## 방법 개요
+
+### 순열-aware 학습
+
+각 epoch의 입력 slot은 `SHA-256(seed, epoch, Id)`로 결정론적으로 섞고 정답
+permutation도 동일 좌표 변환을 적용했습니다. 입력 위치 자체의 shortcut을 줄이고
+test-time canonicalization과 학습 표현을 맞추는 것이 목적입니다.
+
+### Canonical Latin4
+
+네 cyclic permutation은 각 원본 이미지가 네 displayed position에 정확히 한 번씩
+나타나는 Latin square입니다. 각 view의 예측은 먼저 원래 slot 좌표로 역변환한 뒤
+vote합니다. 이 단계를 생략하면 서로 다른 좌표계의 답을 집계하게 됩니다.
+
+### 적은 view를 선택한 이유
+
+24-view는 더 많은 계산으로 permutation coverage를 늘리지만, 이미 균형인 Latin4
+이후에는 편향 감소보다 noisy view의 추가가 커질 수 있습니다. 실제로 동일
+checkpoint-2726에서 TTA24 hard는 0.93193으로 Latin4 hard 0.93542보다 낮았습니다.
+confidence tie-break도 0.92670으로 하락해 최종 시스템에서는 제거했습니다.
+
+### 재현성과 자원 효율
+
+base model, adapter, command, raw output과 physical-memory evidence를 SHA-256
+receipt로 묶었습니다. adapter merge와 multi-model ensemble은 쓰지 않았고,
+단일 resident model과 batch 1로 24 GB 제약을 만족했습니다.
+
+## 학습 재현
+
+최종 adapter는 full-data QLoRA run의 optimizer step 2,726입니다. 학습 코드는
+`snu-train` 진입점과 [src/snuaichal/training.py](src/snuaichal/training.py)에
+있습니다. 장시간 학습 전에 2-step smoke와 checkpoint reload를 먼저 수행하세요.
+
+```bash
+snu-train \
+  --model-path models/Qwen3.6-27B \
+  --model-repository Qwen/Qwen3.6-27B \
+  --model-family qwen3_5 \
+  --model-revision 6a9e13bd6fc8f0983b9b99948120bc37f49c13e9 \
+  --model-manifest configs/weights/qwen36-27b-final.manifest.json \
+  --load-in-4bit \
+  --validation-fraction 0 \
+  --epochs 6 \
+  --image-size 512 \
+  --batch-size 1 \
+  --gradient-accumulation-steps 8 \
+  --lora-rank 32 \
+  --lora-alpha 32 \
+  --seed 42 \
+  --stop-after-steps 2726 \
+  --output-dir outputs/q36-r32-full2726
+```
+
+장비와 library minor version에 따라 kernel 선택과 속도는 달라질 수 있습니다.
+checkpoint의 optimizer/scheduler/RNG까지 포함한 완전 재개를 권장합니다.
 
 ## 저장소 구조
 
 ```text
-.
-├── .github/workflows/ci.yml       # 가벼운 정적 검사와 단위 테스트
-├── data/                          # 대회 데이터(커밋 금지)
-├── docs/
-│   ├── competition_checklist.md  # 규정 준수 체크리스트
-│   └── experiment_log.md         # 실험·비용 기록 양식
-├── models/                        # 로컬 모델 가중치(커밋 금지)
-├── notebooks/                     # 운영진 제공 원본 베이스라인
-├── outputs/                       # 제출 파일과 원시 출력(커밋 금지)
-├── scripts/train.py               # Qwen2-VL LoRA 학습 진입점
-├── src/snuaichal/
-│   ├── evaluation.py             # exact-match 및 실패율 측정
-│   ├── inference.py              # base/LoRA 검증 및 제출 추론
-│   ├── submission.py             # 출력 파싱·순서 변환·검증
-│   └── training.py               # 층화 split·순열 증강·LoRA 학습
-└── tests/                         # 제출 형식 단위 테스트
+configs/
+├── final_inference.json
+└── weights/
+    ├── qwen36-27b-final.manifest.json
+    └── qwen36-checkpoint2726-adapter.manifest.json
+docs/
+├── final_report_5page_ko.pdf
+└── model_licenses.md
+scripts/
+├── download_weights.py
+├── download_final_adapter.py
+└── run_final_inference.py
+src/snuaichal/
+├── inference.py
+├── training.py
+├── tta.py
+├── submission.py
+└── physical_memory.py
+tests/
 ```
 
-## 환경
+## 한계
 
-대회 검증 서버 사양은 AMD EPYC 7502 32-Core Processor 2개, RAM 512 GB,
-NVIDIA RTX 3090 24 GB 1장, NVIDIA driver 550.54.15, CUDA 12.4입니다.
-운영체제는 제공된 규칙에 명시되지 않았으므로 최종 안내를 확인해야 합니다. 이 저장소의
-기준 Python은 공식 노트북과 같은 3.10.20이며 라이브러리는
-`requirements.txt`에 고정했습니다.
+- Qwen3.6 최종 run은 전체 labeled data로 학습했으므로 그 데이터에서의 validation
+  정확도를 모델 선택 근거로 사용할 수 없습니다.
+- 제출 비교는 Public 70%에 노출되어 있어 반복 선택에 따른 leaderboard overfitting
+  가능성이 있습니다.
+- Private 및 외부 데이터 성능은 제출 시 알 수 없으며, 최종 고정 코드로 별도
+  평가받아야 합니다.
+- semantic error 유형에 대한 대규모 수동 annotation과 다중 seed 비교는 완료하지
+  못했습니다.
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
-pip install -r requirements.txt
-pip install -e .
-```
+## 라이선스와 데이터
 
-Windows PowerShell에서는 활성화 명령만 `.\.venv\Scripts\Activate.ps1`로
-바꾸면 됩니다. `requirements.txt`의 일반 PyPI PyTorch가 환경과 맞지 않는 경우
-위 CUDA 12.4 명령으로 먼저 설치하세요.
+Qwen3.6-27B는 원 배포자의 Apache-2.0 라이선스를 따릅니다. 상세 attribution은
+[docs/model_licenses.md](docs/model_licenses.md)를 확인하세요. 대회 데이터와
+이미지는 이 저장소 또는 Release에 포함하지 않습니다.
 
-## 데이터와 모델 준비
-
-운영진 제공 데이터는 [data/README.md](data/README.md), 모델 스냅샷은
-[models/README.md](models/README.md)의 구조로 배치합니다. 데이터와 가중치는
-용량·라이선스·누수 방지를 위해 `.gitignore`로 제외됩니다.
-
-기본 경로는 모두 저장소 루트 기준 상대 경로입니다.
-
-```text
-data/train.csv
-data/train/<Id>/<image file>
-data/test.csv
-data/test/<Id>/<image file>
-models/Qwen2-VL-2B-Instruct/
-```
-
-## 실행
-
-Kaggle에서 팀 생성 권한을 얻기 위한 첫 제출은 모델 없이 즉시 만들 수 있습니다.
-
-```bash
-snu-baseline-submit --test-csv data/test.csv --output outputs/baseline_submission.csv
-```
-
-이 파일은 모든 샘플에 유효한 기본 순열 `[1, 2, 3, 4]`를 사용합니다. 성능 확인용
-모델 베이스라인이 아니라 제출 형식과 팀 생성 절차를 확인하기 위한 파일입니다.
-
-### 재현 대상 모델
-
-| 모델 | local path | 공식 revision | 최초 공개 | 라이선스 | snapshot 크기 |
-|---|---|---|---|---|---|
-| Qwen3-VL-8B-Instruct | `models/Qwen3-VL-8B-Instruct` | `0c351dd01ed87e9c1b53cbc748cba10e6187ff3b` | 2025-10-11 | Apache-2.0 | 약 17.55 GB |
-| Qwen3.5-27B | `models/Qwen3.5-27B` | `fc05daec18b0a78c049392ed2e771dde82bdf654` | 2026-02-24 | Apache-2.0 | 약 55.58 GB |
-
-둘 다 2026-05-31 cutoff 이전 공개 가중치입니다. `Qwen3.5-27B`는 dense
-`Qwen3_5ForConditionalGeneration` 모델입니다. 모델 파일이 없을 때 학습 코드가
-자동 다운로드하지 않습니다. 정확한 다운로드 명령은 [models/README.md](models/README.md)에
-기록되어 있습니다.
-
-### Qwen3-VL-8B 0.91972 레시피
-
-split은 augmentation보다 먼저 수행합니다. 9,535행의 10% validation은 약 954행,
-train은 약 8,581행입니다. effective batch 8일 때 `ceil(8581/8)=1073`
-update/epoch이므로 4 epoch 종료점은 4,292입니다. cosine scheduler는 6 epoch,
-즉 6,438 step horizon을 유지합니다. `max_steps=4292`를 사용하지 않으며 callback이
-4,292에서 저장 후 종료합니다.
-
-2-step VRAM smoke:
-
-```bash
-snu-train \
-  --model-path models/Qwen3-VL-8B-Instruct \
-  --load-in-4bit \
-  --validation-fraction 0.10 \
-  --image-size 512 \
-  --epochs 6 \
-  --stop-after-steps 2 \
-  --batch-size 1 \
-  --gradient-accumulation-steps 8 \
-  --output-dir outputs/qwen3-vl-8b-smoke
-```
-
-전체 학습은 smoke의 peak VRAM, loss, visual token 수를 확인한 뒤에만 실행합니다.
-
-```bash
-snu-train \
-  --model-path models/Qwen3-VL-8B-Instruct \
-  --load-in-4bit \
-  --validation-fraction 0.10 \
-  --image-size 512 \
-  --epochs 6 \
-  --stop-after-steps 4292 \
-  --save-steps 1073 \
-  --batch-size 1 \
-  --gradient-accumulation-steps 8 \
-  --output-dir outputs/qwen3-vl-8b-aug
-```
-
-학습 입력은 매 epoch마다 `SHA-256(seed, epoch, Id)`로 결정된 permutation을
-on-the-fly 적용합니다. validation은 원본 순서를 유지합니다. split Id는
-`split_manifest.json`, scheduler 계획은 `schedule.json`, LoRA target과 trainable
-parameter는 `model_manifest.json`에 저장됩니다. resume 시 scheduler/global step은
-Trainer checkpoint에서 복구되며 4,292 이상 checkpoint의 재개는 거부됩니다.
-
-### Validation과 cyclic 4-TTA
-
-4-TTA 입력 순서는 `[1,2,3,4]`, `[2,3,4,1]`, `[3,4,1,2]`, `[4,1,2,3]`입니다.
-각 view를 순차 실행하고 prediction을 원본 slot 좌표로 역변환한 뒤 canonical Answer에서
-다수결합니다. 동률은 lexicographic minimum으로 결정합니다. 모든 view 파싱 실패일 때만
-identity `[1,2,3,4]`를 사용합니다.
-
-```bash
-snu-infer \
-  --test-csv data/train.csv \
-  --image-dir data/train \
-  --model-path models/Qwen3-VL-8B-Instruct \
-  --adapter-path outputs/qwen3-vl-8b-aug/checkpoint-4292 \
-  --load-in-4bit --image-size 512 --tta 4 \
-  --validation-fraction 0.10 \
-  --output outputs/validation_predictions.csv \
-  --metrics-output outputs/validation_metrics.json
-```
-
-최종 제출:
-
-```bash
-snu-infer \
-  --data-dir data \
-  --model-path models/Qwen3-VL-8B-Instruct \
-  --adapter-path outputs/qwen3-vl-8b-aug/checkpoint-4292 \
-  --load-in-4bit --image-size 512 --tta 4 \
-  --output outputs/submission_v5_8b_aug_checkpoint-4292_tta4.csv \
-  --audit-log outputs/submission_v5_8b_aug_checkpoint-4292_tta4.jsonl
-```
-
-### Public 리더보드 감시
-
-Kaggle public 리더보드의 신규 팀, 점수·순위 및 TOP7/10/16 컷 변동을 터미널에서
-감시할 수 있습니다. 표 상단에는 공식 예선 기간(`2026-06-29 10:00`부터
-`2026-07-24 23:59 KST`)의 진행률과 실시간 마감 카운트다운이 표시됩니다. 기본 우리
-팀명은 `밥먹을돈으로3090사서거지됨`이며 `--team` 또는 `SNUAICHAL_TEAM` 환경변수로
-바꿀 수 있습니다.
-
-```powershell
-# 한 번 조회해 인증과 팀명을 확인
-snu-leaderboard-watch --once
-
-# 기본 30초 간격으로 감시하고 변동 시 터미널 벨 출력
-snu-leaderboard-watch --bell
-
-# 10초 간격, 매번 표 출력
-snu-leaderboard-watch --interval 10 --table
-```
-
-인증은 `~/.kaggle/kaggle.json`의 `username`/`key`, 환경변수
-`KAGGLE_USERNAME`+`KAGGLE_KEY`, 또는 `KAGGLE_API_TOKEN` 중 하나를 사용합니다.
-인증값은 출력이나 상태 파일에 기록하지 않습니다. 마지막 정상 스냅샷과 변동 이력은
-각각 `outputs/leaderboard_watch/state.json`, `events.jsonl`에 저장되어 프로세스를
-재시작해도 중간 변동을 확인할 수 있습니다. 상태를 무시하려면 `--fresh`, 파일을 전혀
-남기지 않으려면 `--no-state`를 사용합니다. 원본 호환 진입점
-`python tools/leaderboard_watch.py`도 제공됩니다.
-
-운영진이 일정을 변경하면 ISO 형식의 `--start`, `--deadline`으로 덮어쓸 수 있습니다.
-
-```powershell
-snu-leaderboard-watch `
-  --start 2026-06-29T10:00+09:00 `
-  --deadline 2026-07-24T23:59+09:00
-```
-
-Qwen3.5-27B challenger는 같은 명령에서 `--model-path models/Qwen3.5-27B`와
-`--output-dir`만 바꿉니다. 기본 LoRA rank는 8입니다. native Windows에서는 pure
-PyTorch fallback을 사용하며, Linux/WSL2 fast kernel은
-`requirements-linux-kernels.txt`의 선택 의존성을 사용합니다. 27B는 먼저 2-step
-VRAM smoke만 수행하고 8B pipeline 검증 전에는 장시간 학습하지 않습니다.
-
-모델/processor 로딩은 기본 `local_files_only=True`입니다. 완전 오프라인 검증은
-`HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`을 설정해 실행합니다. VRAM은 학습의
-`training_summary.json`과 validation의 `peak_vram_mib`로 확인하며 필요하면 별도로
-`nvidia-smi --query-compute-apps=used_memory --format=csv`를 기록합니다.
-
-validation metric에는 Exact Match, identity/non-identity accuracy, parse failure,
-TTA consistency, seconds/sample, peak VRAM, 24×24 permutation confusion이 포함됩니다.
-audit JSONL에는 TTA별 raw prediction과 canonical prediction이 기록됩니다. 최종 CSV는
-Id 순서·행 수·모든 Answer의 1~4 순열 여부를 저장 전에 검증합니다.
-
-## 테스트
-
-```bash
-pip install -r requirements-dev.txt
-pip install -e .
-ruff check src tests scripts tools
-pytest
-```
-
-단위 테스트는 `[4, 2, 1, 3]` 같은 시간순 모델 출력을 대회 제출 정의인
-`[3, 2, 4, 1]`로 정확히 변환하는지, 잘못된 순열을 거부하는지 검증합니다.
-
-## 규정 준수
-
-현재 구현은 외부 API, 외부 데이터, 앙상블을 사용하지 않는 단일 모델 zero-shot
-베이스라인이며 외부 API 비용은 `0 KRW`입니다. 공식 규칙상 상용 API는 학습과
-추론에 사용할 수 없고, 데이터 전처리에만 총 30,000원 한도로 사용할 수 있습니다.
-또한 제공 데이터 자체의 증강은 가능하지만 생성형 모델을 이용한 데이터 생성·변형은
-허용되지 않습니다. 이후 방법을 변경할 때는
-[규정 체크리스트](docs/competition_checklist.md)와
-[실험 기록 양식](docs/experiment_log.md)을 함께 갱신하세요.
-
-특히 다음은 자동화만으로 보장할 수 없으므로 제출자가 직접 확인해야 합니다.
-
-- 모델 가중치의 최초 공개일과 라이선스 근거
-- RTX 3090 24 GB에서 전체 테스트 추론 24시간 이내 완료
-- 평가 데이터 정보가 학습·전처리·모델 설계에 사용되지 않았는지 여부
-- 코드와 가중치를 합친 최종 크기가 80 GB 이하인지 여부
-- 운영진의 최신 공지와 Kaggle Discussion 답변
-
-공식 [Rules](https://snuaichallenge.github.io/rules/)는 대회 중 추가될 수 있으므로
-제출 전마다 다시 확인하세요. 제출 횟수는 FAQ 기준 UTC 하루 최대 2회입니다.
-
-## 원본 베이스라인
-
-운영진 제공 노트북은 `notebooks/SNU_AI_Challenge_Baseline_Code.ipynb`에 원형으로
-보관합니다. 실제 재현성 검증에는 노트북이 아니라 `src/snuaichal/inference.py`를
-사용하세요.
+프로젝트 코드에는 별도의 최상위 `LICENSE`가 아직 없으므로, 저장소 소유자가
+라이선스를 승인하기 전까지 이 저장소 자체가 재사용 권한을 부여한다고 해석해서는
+안 됩니다.

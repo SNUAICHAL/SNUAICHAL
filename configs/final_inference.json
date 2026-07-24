@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "model": {
+    "repository": "Qwen/Qwen3.6-27B",
+    "revision": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+    "family": "qwen3_5",
+    "tree_sha256": "e4107e6508793261ca372faf4b560dcb55a5b6ba79a5ab921bfe1b25a207ec07"
+  },
+  "adapter": {
+    "checkpoint_step": 2726,
+    "rank": 32,
+    "alpha": 32,
+    "dropout": 0.05,
+    "sha256": "189f6c1be09bce1a9b71afeb4807b255b4c144fd2ddfc495ba0109d08ca9f1f6"
+  },
+  "runtime": {
+    "precision": "nf4",
+    "compute_dtype": "bfloat16",
+    "attention": "sdpa",
+    "image_size": 512,
+    "max_new_tokens": 64,
+    "batch_size": 1,
+    "seed": 42,
+    "enable_thinking": false
+  },
+  "tta": {
+    "orders": [[1, 2, 3, 4], [2, 3, 4, 1], [3, 4, 1, 2], [4, 1, 2, 3]],
+    "canonicalize_to_original_slots": true,
+    "aggregation": "hard_majority",
+    "tie_break": "lexicographic"
+  }
+}

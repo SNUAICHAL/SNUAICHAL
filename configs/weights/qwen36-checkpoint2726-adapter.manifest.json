@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "repository": "SNUAICHAL/SNUAICHAL",
+  "release_tag": "final-q36-2726-v1",
+  "download_url": "https://github.com/SNUAICHAL/SNUAICHAL/releases/download/final-q36-2726-v1/q36-checkpoint2726-adapter.tar.gz",
+  "archive_sha256": "f89df01d00d3b4808881abd2abb2d48df35213c1b1506dd856ac66c62cd5a054",
+  "archive_size_bytes": 591369852,
+  "checkpoint_step": 2726,
+  "epoch": 2.2869428421604616,
+  "training_rows": 9535,
+  "base_repository": "Qwen/Qwen3.6-27B",
+  "base_revision": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+  "adapter_rank": 32,
+  "adapter_alpha": 32,
+  "files": [
+    {
+      "path": "adapter_config.json",
+      "sha256": "f650e1fc74ccc85a88a4ba8f7e8f57d497b5955e8777376d31fb478bdba1f8c5",
+      "size_bytes": 1117
+    },
+    {
+      "path": "adapter_model.safetensors",
+      "sha256": "189f6c1be09bce1a9b71afeb4807b255b4c144fd2ddfc495ba0109d08ca9f1f6",
+      "size_bytes": 637610624
+    }
+  ],
+  "manifest_sha256": "e23acccefc70209f344c87ca96661fcbf349cfb437de8b961fc247c919161a09"
+}

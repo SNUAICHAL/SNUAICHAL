@@ -21,6 +21,8 @@ data/*
 models/*
 !models/README.md
 outputs/*
+weights/*
+tmp/
 !outputs/.gitkeep
 *.pt
 *.pth
@@ -30,5 +32,22 @@ outputs/*
 # Notebook checkpoints and local secrets
 .ipynb_checkpoints/
 .env
+.env.*
+!.env.example
+kaggle.json
+**/kaggle.json
+id_rsa
+id_ed25519
+*.pem
+*.key
+*.p12
+*.pfx
 *.log
 
+# Large local archives and report-render scratch
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+.hermes-edge-pdf/
+docs/*.rendered.txt
