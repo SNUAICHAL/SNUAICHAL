@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import ast
+import csv
 import json
+import os
 import random
 import time
 from collections import Counter
@@ -16,6 +18,7 @@ from snuaichal.confidence import align_answer_confidence
 from snuaichal.modeling import apply_model_chat_template
 from snuaichal.submission import (
     answer_to_string,
+    is_permutation,
     parse_model_output,
     validate_submission_records,
 )
@@ -29,6 +32,87 @@ from snuaichal.tta import (
 )
 
 REQUIRED_COLUMNS = {"Id", "Sentence", "Input_1", "Input_2", "Input_3", "Input_4"}
+
+
+def _atomic_write_progress(
+    *,
+    output: Path,
+    audit_log: Path,
+    predictions: list[dict[str, str]],
+    audit_rows: list[dict[str, Any]],
+) -> None:
+    """Persist a matched row prefix so interrupted inference can resume safely."""
+    if len(predictions) != len(audit_rows):
+        raise RuntimeError("prediction/audit progress length mismatch")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    audit_log.parent.mkdir(parents=True, exist_ok=True)
+    output_tmp = output.with_name(f"{output.name}.part-{os.getpid()}")
+    audit_tmp = audit_log.with_name(f"{audit_log.name}.part-{os.getpid()}")
+    with output_tmp.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["Id", "Answer"])
+        writer.writeheader()
+        writer.writerows(predictions)
+        handle.flush()
+        os.fsync(handle.fileno())
+    with audit_tmp.open("w", encoding="utf-8", newline="\n") as handle:
+        for row in audit_rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(output_tmp, output)
+    os.replace(audit_tmp, audit_log)
+
+
+def _load_resume_prefix(
+    *,
+    output: Path,
+    audit_log: Path,
+    expected_ids: list[str],
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    """Load only an exact canonical-ID prefix; reject unrelated cached rows."""
+    if output.exists() != audit_log.exists():
+        raise RuntimeError("resume requires both prediction and audit progress files")
+    if not output.exists():
+        return [], []
+    with output.open("r", encoding="utf-8", newline="") as handle:
+        predictions = [dict(row) for row in csv.DictReader(handle)]
+    audit_rows = [
+        json.loads(line)
+        for line in audit_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if len(predictions) != len(audit_rows):
+        raise RuntimeError("resume prediction/audit progress is not atomic")
+    ids = [str(row.get("Id")) for row in predictions]
+    audit_ids = [str(row.get("Id")) for row in audit_rows]
+    if ids != audit_ids or ids != expected_ids[: len(ids)]:
+        raise RuntimeError("resume rows are not the canonical expected-ID prefix")
+    validate_submission_records(
+        predictions,
+        expected_ids=expected_ids[: len(predictions)],
+        expected_count=len(predictions),
+    )
+    return predictions, audit_rows
+
+
+def parse_tta_orders_json(value: str) -> tuple[tuple[int, ...], ...]:
+    """Parse and validate an explicit ordered list of TTA permutations."""
+    try:
+        raw_orders = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError("TTA orders must be valid JSON") from exc
+    if not isinstance(raw_orders, list) or not raw_orders:
+        raise argparse.ArgumentTypeError("TTA orders must be a nonempty JSON list")
+    orders: list[tuple[int, ...]] = []
+    for raw_order in raw_orders:
+        if not is_permutation(raw_order):
+            raise argparse.ArgumentTypeError(
+                f"invalid TTA input order: {raw_order!r}"
+            )
+        orders.append(tuple(raw_order))
+    if len(set(orders)) != len(orders):
+        raise argparse.ArgumentTypeError("TTA orders must be unique")
+    return tuple(orders)
 
 
 @dataclass(frozen=True)
@@ -110,6 +194,7 @@ def build_model_load_kwargs(
     dtype: Any,
     device_map: Any,
     local_files_only: bool,
+    attn_implementation: str,
     quantization_config: Any = None,
 ) -> dict[str, Any]:
     """Build auditable NF4/BF16 loader arguments without an implicit fallback."""
@@ -119,7 +204,7 @@ def build_model_load_kwargs(
         "dtype": dtype,
         "device_map": {"": 0} if precision == "nf4" else device_map,
         "local_files_only": local_files_only,
-        "attn_implementation": "sdpa",
+        "attn_implementation": attn_implementation,
     }
     if precision == "nf4":
         if quantization_config is None:
@@ -300,6 +385,41 @@ def canonicalize_view_result(
     return canonicalize_view_prediction(view_prediction, view_order=view_order)
 
 
+def build_inference_memory_metrics(
+    *,
+    logical_peak_allocated_bytes: int,
+    logical_peak_reserved_bytes: int,
+    physical_measurement: dict[str, Any],
+) -> dict[str, Any]:
+    """Record allocator and independently sampled physical VRAM without conflation."""
+    for name, value in (
+        ("logical_peak_allocated_bytes", logical_peak_allocated_bytes),
+        ("logical_peak_reserved_bytes", logical_peak_reserved_bytes),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+    if logical_peak_allocated_bytes > logical_peak_reserved_bytes:
+        raise ValueError("logical peak allocated bytes cannot exceed reserved bytes")
+    protected = {
+        "peak_vram_mib",
+        "logical_peak_allocated_bytes",
+        "logical_peak_reserved_bytes",
+    }
+    collisions = protected.intersection(physical_measurement)
+    if collisions:
+        raise ValueError(
+            "physical measurement cannot overwrite allocator metrics: "
+            f"{sorted(collisions)}"
+        )
+    return {
+        "peak_vram_mib": logical_peak_allocated_bytes / (1024 * 1024),
+        "logical_peak_allocated_bytes": logical_peak_allocated_bytes,
+        "logical_peak_reserved_bytes": logical_peak_reserved_bytes,
+        "physical_memory_schema_version": physical_measurement.get("schema_version"),
+        **{key: value for key, value in physical_measurement.items() if key != "schema_version"},
+    }
+
+
 def run(args: argparse.Namespace) -> None:
     """Run deterministic inference and write both submission and audit logs."""
     try:
@@ -314,11 +434,13 @@ def run(args: argparse.Namespace) -> None:
             "Inference dependencies are missing. Run: pip install -r requirements.txt"
         ) from exc
 
+    from snuaichal.model_manifest import verify_model_manifest
     from snuaichal.modeling import (
         create_4bit_config,
         detect_model_family,
         resolve_model_class,
     )
+    from snuaichal.physical_memory import ExternalPhysicalMemoryMonitor
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -337,6 +459,13 @@ def run(args: argparse.Namespace) -> None:
         )
     if args.adapter_path is not None and not args.adapter_path.is_dir():
         raise FileNotFoundError(f"Local LoRA adapter not found: {args.adapter_path}")
+    verified_model_manifest = verify_model_manifest(
+        args.model_manifest,
+        model_root=args.model_path,
+        expected_repository=args.model_repository,
+        expected_revision=args.model_revision,
+        expected_family=args.model_family,
+    )
 
     test_df = pd.read_csv(test_csv, dtype={"Id": str})
     missing_columns = REQUIRED_COLUMNS.difference(test_df.columns)
@@ -368,17 +497,27 @@ def run(args: argparse.Namespace) -> None:
         test_df = test_df.head(args.limit)
 
     precision = resolve_precision(args)
+    physical_monitor = None
+    if torch.cuda.is_available():
+        physical_monitor = ExternalPhysicalMemoryMonitor(args.metrics_output.parent)
+        physical_monitor.start()
     dtype = torch.bfloat16 if precision == "bf16" else _resolve_dtype(torch, args.dtype)
     config = AutoConfig.from_pretrained(
         args.model_path, local_files_only=not args.allow_network
     )
     family = detect_model_family(config)
+    if family.value != args.model_family:
+        raise RuntimeError(
+            f"Detected model family {family.value!r} differs from declared "
+            f"{args.model_family!r}"
+        )
     model_class = resolve_model_class(config, transformers)
     model_kwargs = build_model_load_kwargs(
         precision=precision,
         dtype=dtype,
         device_map=args.device_map,
         local_files_only=not args.allow_network,
+        attn_implementation=args.attn_implementation,
         quantization_config=(
             create_4bit_config(torch, transformers) if precision == "nf4" else None
         ),
@@ -402,8 +541,20 @@ def run(args: argparse.Namespace) -> None:
     model.config.use_cache = True
     runtime_state = collect_model_runtime_state(model, torch, precision=precision)
 
-    predictions: list[dict[str, str]] = []
-    audit_rows: list[dict[str, Any]] = []
+    expected_ids = [str(sample_id) for sample_id in test_df["Id"].tolist()]
+    if args.resume and (
+        args.validation_manifest is not None or args.validation_fraction is not None
+    ):
+        raise ValueError("row-resume is supported only for unlabeled test inference")
+    predictions, audit_rows = (
+        _load_resume_prefix(
+            output=args.output,
+            audit_log=args.audit_log,
+            expected_ids=expected_ids,
+        )
+        if args.resume
+        else ([], [])
+    )
     metric_predictions: list[list[int] | None] = []
     metric_predictions_by_mode: dict[str, list[list[int] | None]] = {
         mode: [] for mode in ("hard", "confidence_tiebreak", "confidence_weighted")
@@ -413,15 +564,41 @@ def run(args: argparse.Namespace) -> None:
     metric_no_ordering: list[bool] = []
     metric_tta_patterns: list[str] = []
     tta_consistency: list[bool] = []
-    all_image_grids: list[list[int]] = []
-    all_visual_tokens: list[int] = []
-    parse_failures = 0
-    tta_orders = CYCLIC_TTA_ORDERS[:1] if args.tta == 1 else CYCLIC_TTA_ORDERS
+    all_image_grids: list[list[int]] = [
+        grid
+        for audit in audit_rows
+        for view in audit.get("views", [])
+        for grid in view.get("image_grid_thw", [])
+    ]
+    all_visual_tokens: list[int] = [
+        token
+        for audit in audit_rows
+        for view in audit.get("views", [])
+        for token in view.get("visual_tokens", [])
+    ]
+    parse_failures = sum(not bool(row.get("parse_ok")) for row in audit_rows)
+    tta_orders = (
+        args.tta_orders
+        if args.tta_orders is not None
+        else (CYCLIC_TTA_ORDERS[:1] if args.tta == 1 else CYCLIC_TTA_ORDERS)
+    )
+    if len(tta_orders) != args.tta:
+        raise ValueError(
+            f"Explicit TTA order count {len(tta_orders)} does not match --tta {args.tta}"
+        )
+    if args.fallback_policy != "identity":
+        raise ValueError(f"Unsupported fallback policy: {args.fallback_policy}")
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     inference_started = time.perf_counter()
 
-    for _, row in tqdm(test_df.iterrows(), total=len(test_df), desc="Inference"):
+    pending_df = test_df.iloc[len(predictions) :]
+    for _, row in tqdm(
+        pending_df.iterrows(),
+        total=len(test_df),
+        initial=len(predictions),
+        desc="Inference",
+    ):
         view_audit = []
         canonical_predictions: list[list[int] | None] = []
         view_confidences: list[float | None] = []
@@ -524,48 +701,91 @@ def run(args: argparse.Namespace) -> None:
                 "views": view_audit,
             }
         )
+        _atomic_write_progress(
+            output=args.output,
+            audit_log=args.audit_log,
+            predictions=predictions,
+            audit_rows=audit_rows,
+        )
 
     elapsed_seconds = time.perf_counter() - inference_started
-    expected_ids = [str(sample_id) for sample_id in test_df["Id"].tolist()]
     validate_submission_records(
         predictions,
         expected_ids=expected_ids,
         expected_count=len(expected_ids),
     )
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(predictions, columns=["Id", "Answer"]).to_csv(
-        args.output, index=False, encoding="utf-8"
+    _atomic_write_progress(
+        output=args.output,
+        audit_log=args.audit_log,
+        predictions=predictions,
+        audit_rows=audit_rows,
     )
-    args.audit_log.parent.mkdir(parents=True, exist_ok=True)
-    with args.audit_log.open("w", encoding="utf-8", newline="\n") as log_file:
-        for row in audit_rows:
-            log_file.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     print(f"Saved {len(predictions)} predictions to {args.output}")
     print(f"Parse failures: {parse_failures}/{len(predictions)}")
+    peak_allocated_bytes = (
+        torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+    )
+    peak_reserved_bytes = (
+        torch.cuda.max_memory_reserved() if torch.cuda.is_available() else 0
+    )
+    physical_measurement = (
+        physical_monitor.close()
+        if physical_monitor is not None
+        else {
+            "physical_measurement_status": "not_applicable",
+            "physical_peak_observed_bytes": None,
+            "physical_total_vram_bytes": None,
+            "physical_measurement_source": None,
+        }
+    )
+    memory_metrics = build_inference_memory_metrics(
+        logical_peak_allocated_bytes=peak_allocated_bytes,
+        logical_peak_reserved_bytes=peak_reserved_bytes,
+        physical_measurement=physical_measurement,
+    )
+    seconds_per_sample = elapsed_seconds / len(predictions)
+    metrics: dict[str, Any] = {
+        "samples": len(predictions),
+        "parse_failures": parse_failures,
+        "parse_failure_rate": parse_failures / len(predictions),
+        "inference_seconds_per_sample": seconds_per_sample,
+        "estimated_test_seconds": seconds_per_sample * 819,
+        **memory_metrics,
+        "model_precision": precision,
+    }
     if metric_references:
         from snuaichal.evaluation import (
             compare_prediction_modes,
             compute_exact_match_metrics,
         )
 
-        peak_vram_bytes = (
-            torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
-        )
-        metrics = compute_exact_match_metrics(
-            metric_predictions,
-            metric_references,
-            tta_consistent=tta_consistency,
-            no_ordering=metric_no_ordering or None,
-            tta_agreement_patterns=metric_tta_patterns,
-            elapsed_seconds=elapsed_seconds,
-            peak_vram_bytes=peak_vram_bytes,
-            model_precision=precision,
-            image_grid_thw=all_image_grids,
-            visual_tokens=all_visual_tokens,
+        metrics.update(
+            compute_exact_match_metrics(
+                metric_predictions,
+                metric_references,
+                tta_consistent=tta_consistency,
+                no_ordering=metric_no_ordering or None,
+                tta_agreement_patterns=metric_tta_patterns,
+                elapsed_seconds=elapsed_seconds,
+                peak_vram_bytes=peak_allocated_bytes,
+                model_precision=precision,
+                image_grid_thw=all_image_grids,
+                visual_tokens=all_visual_tokens,
+            )
         )
         metrics.update(
             {
+                "non_identity_exact_matches": sum(
+                    prediction is not None and prediction == reference
+                    for prediction, reference, no_ordering in zip(
+                        metric_predictions,
+                        metric_references,
+                        metric_no_ordering,
+                        strict=True,
+                    )
+                    if not no_ordering
+                ),
                 "aggregation_comparison": {
                     mode: {
                         "vs_hard": compare_prediction_modes(
@@ -581,21 +801,35 @@ def run(args: argparse.Namespace) -> None:
                     }
                     for mode, mode_predictions in metric_predictions_by_mode.items()
                 },
-                "aggregation_mode": args.aggregation_mode,
-                "adapter_path": str(args.adapter_path) if args.adapter_path else None,
-                "base_model_path": str(args.model_path),
-                "confidence_temperature": args.confidence_temperature,
-                "max_pixels": args.max_pixels or args.image_size**2,
-                "min_pixels": args.min_pixels,
-                "runtime_state": runtime_state,
-                "tta_views": args.tta,
             }
         )
-        args.metrics_output.parent.mkdir(parents=True, exist_ok=True)
-        args.metrics_output.write_text(
-            json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
-        print(json.dumps(metrics, sort_keys=True))
+    metrics.update(
+        {
+            "aggregation_mode": args.aggregation_mode,
+            "adapter_path": str(args.adapter_path) if args.adapter_path else None,
+            "base_model_path": str(args.model_path),
+            "model_repository": args.model_repository,
+            "model_family": family.value,
+            "detected_model_family": family.value,
+            "declared_model_family": args.model_family,
+            "model_revision": args.model_revision,
+            "model_manifest_path": str(args.model_manifest),
+            "model_manifest_sha256": verified_model_manifest["manifest_sha256"],
+            "verified_model_tree_sha256": verified_model_manifest["tree_sha256"],
+            "confidence_temperature": args.confidence_temperature,
+            "fallback_policy": args.fallback_policy,
+            "max_pixels": args.max_pixels or args.image_size**2,
+            "min_pixels": args.min_pixels,
+            "runtime_state": runtime_state,
+            "tta_orders": [list(order) for order in tta_orders],
+            "tta_views": len(tta_orders),
+        }
+    )
+    args.metrics_output.parent.mkdir(parents=True, exist_ok=True)
+    args.metrics_output.write_text(
+        json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    print(json.dumps(metrics, sort_keys=True))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -603,10 +837,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--test-csv", type=Path)
     parser.add_argument("--image-dir", type=Path)
+    parser.add_argument("--model-path", type=Path, required=True)
+    parser.add_argument("--model-repository", required=True)
     parser.add_argument(
-        "--model-path", type=Path, default=Path("models/Qwen2-VL-2B-Instruct")
+        "--model-family",
+        choices=("qwen2_vl", "qwen3_vl", "qwen3_vl_moe", "qwen3_5"),
+        required=True,
     )
-    parser.add_argument("--adapter-path", type=Path)
+    parser.add_argument("--model-revision", required=True)
+    parser.add_argument("--model-manifest", type=Path, required=True)
+    adapter_group = parser.add_mutually_exclusive_group(required=True)
+    adapter_group.add_argument("--adapter-path", type=Path)
+    adapter_group.add_argument(
+        "--no-adapter",
+        action="store_true",
+        help="Explicitly run the base model without a PEFT adapter",
+    )
     parser.add_argument(
         "--validation-fraction",
         type=float,
@@ -637,6 +883,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--precision",
         choices=("nf4", "bf16"),
+        required=True,
         help="Explicit base-model inference precision",
     )
     parser.add_argument(
@@ -644,11 +891,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Deprecated compatibility alias for --precision nf4",
     )
-    parser.add_argument("--tta", type=int, choices=(1, 4), default=1)
+    parser.add_argument("--tta", type=int, choices=(1, 4), required=True)
+    parser.add_argument(
+        "--tta-orders-json",
+        dest="tta_orders",
+        type=parse_tta_orders_json,
+        help="Explicit ordered JSON list of TTA input permutations",
+    )
     parser.add_argument(
         "--aggregation-mode",
         choices=("hard", "confidence_tiebreak", "confidence_weighted"),
-        default="hard",
+        required=True,
+    )
+    parser.add_argument(
+        "--fallback-policy",
+        choices=("identity",),
+        default="identity",
+        help="Explicit policy used when every TTA view fails to parse",
     )
     parser.add_argument("--confidence-temperature", type=float, default=1.0)
     parser.add_argument(
@@ -657,8 +916,19 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     parser.add_argument("--device-map", default="auto")
+    parser.add_argument(
+        "--attn-implementation",
+        choices=("sdpa",),
+        default="sdpa",
+        help="Explicit deterministic attention backend",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--limit", type=int, help="Smoke-test only the first N rows")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume an exact canonical-ID prediction/audit prefix",
+    )
     parser.add_argument(
         "--allow-network",
         action="store_true",

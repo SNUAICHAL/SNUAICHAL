@@ -16,6 +16,7 @@ from typing import Any, Callable
 from snuaichal.augmentation import DatasetEpochCallback, EpochShuffleDataset
 from snuaichal.inference import build_messages
 from snuaichal.modeling import ModelFamily, apply_model_chat_template
+from snuaichal.physical_memory import ExternalPhysicalMemoryMonitor
 from snuaichal.scheduling import (
     HorizonTrainer,
     StopAtStepCallback,
@@ -145,6 +146,36 @@ def split_rows_without_image_overlap(
     train_rows = [row for row in rows if str(row["Id"]) not in validation_ids]
     random_generator.shuffle(train_rows)
     random_generator.shuffle(validation_rows)
+    return train_rows, validation_rows
+
+
+def select_training_rows(
+    rows: list[Any],
+    *,
+    image_dir: Path,
+    validation_fraction: float,
+    seed: int,
+    limit: int | None,
+    clean_validation: bool,
+) -> tuple[list[Any], list[Any]]:
+    """Apply the production split to all rows before limiting each partition."""
+    if clean_validation:
+        train_rows, validation_rows = split_rows_without_image_overlap(
+            rows,
+            image_dir=image_dir,
+            validation_fraction=validation_fraction,
+            seed=seed,
+        )
+    else:
+        train_rows, validation_rows = split_rows(
+            rows, validation_fraction=validation_fraction, seed=seed
+        )
+    if limit is not None:
+        if limit < 2:
+            raise ValueError("limit must be at least 2")
+        limited_validation_size = max(1, round(limit * validation_fraction))
+        validation_rows = validation_rows[:limited_validation_size]
+        train_rows = train_rows[: limit - limited_validation_size]
     return train_rows, validation_rows
 
 
@@ -323,6 +354,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model-path", type=Path, default=Path("models/Qwen2-VL-2B-Instruct")
     )
+    parser.add_argument("--model-repository")
+    parser.add_argument("--model-family")
+    parser.add_argument("--model-revision")
+    parser.add_argument("--model-manifest", type=Path)
     parser.add_argument(
         "--output-dir", type=Path, default=Path("outputs/qwen2-vl-lora")
     )
@@ -453,12 +488,150 @@ def build_training_argument_kwargs(
     }
 
 
+ALLOCATOR_MEMORY_SEMANTICS = (
+    "PyTorch CUDA allocator accounting; allocated is contained in reserved, and either "
+    "may exceed dedicated physical residency under pageable/WDDM execution"
+)
+
+
+def _non_negative_int(name: str, value: Any, *, positive: bool = False) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    if value < (1 if positive else 0):
+        qualifier = "positive" if positive else "non-negative"
+        raise ValueError(f"{name} must be {qualifier}")
+    return value
+
+
+def build_vram_measurements(
+    *,
+    logical_peak_allocated_bytes: int,
+    logical_peak_reserved_bytes: int,
+    allocator_backend: str,
+    physical_measurement: dict[str, Any],
+) -> dict[str, Any]:
+    """Combine logical allocator diagnostics with one external physical measurement."""
+    allocated = _non_negative_int(
+        "logical_peak_allocated_bytes", logical_peak_allocated_bytes
+    )
+    reserved = _non_negative_int(
+        "logical_peak_reserved_bytes", logical_peak_reserved_bytes
+    )
+    if allocated > reserved:
+        raise ValueError(
+            "logical peak allocated bytes cannot exceed logical peak reserved bytes"
+        )
+    if not isinstance(allocator_backend, str) or not allocator_backend.strip():
+        raise ValueError("allocator_backend must be non-empty")
+    status = physical_measurement.get("physical_measurement_status")
+    if status not in {"valid", "indeterminate"}:
+        raise ValueError("physical measurement status is invalid")
+    result = {
+        "memory_schema_version": 3,
+        "logical_peak_allocated_bytes": allocated,
+        "logical_peak_reserved_bytes": reserved,
+        "allocator_backend": allocator_backend,
+        "allocator_memory_semantics": ALLOCATOR_MEMORY_SEMANTICS,
+        **physical_measurement,
+    }
+    if status == "valid":
+        total = _non_negative_int(
+            "physical_total_vram_bytes",
+            result.get("physical_total_vram_bytes"),
+            positive=True,
+        )
+        observed = _non_negative_int(
+            "physical_peak_observed_bytes",
+            result.get("physical_peak_observed_bytes"),
+        )
+        samples = _non_negative_int(
+            "sample_count", result.get("sample_count"), positive=True
+        )
+        source = result.get("physical_measurement_source")
+        if source not in {
+            "nvml_per_process_used_bytes",
+            "nvml_device_memory_info_used",
+        }:
+            raise ValueError("physical measurement source is invalid")
+        if observed > total:
+            raise ValueError("physical peak exceeds physical total VRAM")
+        result["physical_total_vram_bytes"] = total
+        result["physical_peak_observed_bytes"] = observed
+        result["sample_count"] = samples
+        result["continuation_gate_source"] = source
+        result["continuation_gate_bytes"] = observed
+    else:
+        if result.get("physical_peak_observed_bytes") is not None:
+            raise ValueError("indeterminate physical measurement cannot have a peak")
+        if result.get("physical_measurement_source") is not None:
+            raise ValueError("indeterminate physical measurement cannot select a source")
+        if result.get("sample_count") != 0:
+            raise ValueError("indeterminate physical measurement must select zero samples")
+        if not str(result.get("physical_measurement_reason", "")).strip():
+            raise ValueError("indeterminate physical measurement requires a reason")
+        result["continuation_gate_source"] = None
+        result["continuation_gate_bytes"] = None
+    return result
+
+
+def build_training_summary(
+    *,
+    global_step: int,
+    epoch: float | None,
+    learning_rate: float,
+    training_loss: float,
+    train_metrics: dict[str, Any],
+    initial_global_step: int = 0,
+    vram_measurements: dict[str, Any] | None = None,
+    peak_vram_bytes: int | None = None,
+) -> dict[str, Any]:
+    """Build an auditable training summary including invocation-local step timing."""
+    if vram_measurements is None:
+        if peak_vram_bytes is None:
+            raise ValueError("VRAM measurements are required")
+        # Compatibility for callers that only build legacy summaries in unit tests.
+        vram_measurements = {"peak_vram_bytes": int(peak_vram_bytes)}
+    final_global_step = int(global_step)
+    initial_step = int(initial_global_step)
+    optimizer_steps_this_run = final_global_step - initial_step
+    if initial_step < 0 or optimizer_steps_this_run <= 0:
+        raise ValueError("training summary requires a positive invocation-local step delta")
+    runtime = (
+        float(train_metrics["train_runtime"])
+        if train_metrics.get("train_runtime") is not None
+        else None
+    )
+    steps_per_second = (
+        optimizer_steps_this_run / runtime
+        if runtime is not None and runtime > 0
+        else None
+    )
+    summary = {
+        "global_step": final_global_step,
+        "initial_global_step": initial_step,
+        "optimizer_steps_this_run": optimizer_steps_this_run,
+        "epoch": epoch,
+        "learning_rate": float(learning_rate),
+        "training_loss": float(training_loss),
+        "train_runtime_seconds": runtime,
+        "train_steps_per_second": steps_per_second,
+        "seconds_per_optimizer_step": (
+            runtime / optimizer_steps_this_run
+            if runtime is not None and runtime > 0
+            else None
+        ),
+    }
+    summary.update(vram_measurements)
+    return summary
+
+
 def run(args: argparse.Namespace) -> None:
     import torch
     import transformers
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
     from transformers import AutoConfig, AutoProcessor, TrainingArguments
 
+    from snuaichal.model_manifest import verify_model_manifest
     from snuaichal.modeling import (
         count_parameters,
         create_4bit_config,
@@ -470,6 +643,23 @@ def run(args: argparse.Namespace) -> None:
     )
 
     seed_training(args.seed)
+    model_identity_values = (
+        args.model_repository,
+        args.model_family,
+        args.model_revision,
+        args.model_manifest,
+    )
+    if any(value is None for value in model_identity_values):
+        raise ValueError(
+            "training requires model repository, family, revision, and manifest"
+        )
+    verified_model_manifest = verify_model_manifest(
+        args.model_manifest,
+        model_root=args.model_path,
+        expected_repository=args.model_repository,
+        expected_revision=args.model_revision,
+        expected_family=args.model_family,
+    )
 
     train_csv = args.data_dir / "train.csv"
     image_dir = args.data_dir / "train"
@@ -501,23 +691,14 @@ def run(args: argparse.Namespace) -> None:
     missing_columns = required_columns.difference(rows[0])
     if missing_columns:
         raise ValueError(f"Missing train.csv columns: {sorted(missing_columns)}")
-    if args.clean_validation:
-        train_rows, validation_rows = split_rows_without_image_overlap(
-            rows,
-            image_dir=image_dir,
-            validation_fraction=args.validation_fraction,
-            seed=args.seed,
-        )
-    else:
-        train_rows, validation_rows = split_rows(
-            rows, validation_fraction=args.validation_fraction, seed=args.seed
-        )
-    if args.limit is not None:
-        if args.limit < 2:
-            raise ValueError("limit must be at least 2")
-        limited_validation_size = max(1, round(args.limit * args.validation_fraction))
-        validation_rows = validation_rows[:limited_validation_size]
-        train_rows = train_rows[: args.limit - limited_validation_size]
+    train_rows, validation_rows = select_training_rows(
+        rows,
+        image_dir=image_dir,
+        validation_fraction=args.validation_fraction,
+        seed=args.seed,
+        limit=args.limit,
+        clean_validation=args.clean_validation,
+    )
     write_split_manifest(
         args.output_dir,
         train_rows=train_rows,
@@ -547,6 +728,11 @@ def run(args: argparse.Namespace) -> None:
             "checkpoint_steps": list(schedule.checkpoint_steps),
         },
     )
+
+    physical_monitor = ExternalPhysicalMemoryMonitor(
+        args.output_dir, interval_seconds=0.5
+    )
+    physical_monitor.start()
 
     bf16 = torch.cuda.is_bf16_supported()
     dtype = torch.bfloat16 if bf16 else torch.float16
@@ -602,6 +788,10 @@ def run(args: argparse.Namespace) -> None:
         "architecture": model_class.__name__,
         "model_type": config.model_type,
         "model_path": str(args.model_path),
+        "model_repository": args.model_repository,
+        "model_revision": args.model_revision,
+        "model_manifest_sha256": verified_model_manifest["manifest_sha256"],
+        "verified_model_tree_sha256": verified_model_manifest["tree_sha256"],
         "load_in_4bit": args.load_in_4bit,
         "lora_rank": lora_rank,
         "lora_alpha": args.lora_alpha,
@@ -638,26 +828,43 @@ def run(args: argparse.Namespace) -> None:
         ],
         scheduler_horizon_steps=schedule.scheduler_horizon_steps,
     )
+    initial_global_step = 0
+    if args.resume_from_checkpoint is not None:
+        source_state = json.loads(
+            (args.resume_from_checkpoint / "trainer_state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        initial_global_step = int(source_state["global_step"])
     torch.cuda.reset_peak_memory_stats()
     train_result = trainer.train(
         resume_from_checkpoint=(
             str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None
         )
     )
-    summary = {
-        "global_step": trainer.state.global_step,
-        "epoch": trainer.state.epoch,
-        "learning_rate": trainer._get_learning_rate(),
-        "training_loss": train_result.training_loss,
-        "peak_vram_bytes": torch.cuda.max_memory_allocated(),
-    }
+    final_dir = args.output_dir / "final"
+    trainer.save_model(final_dir)
+    processor.save_pretrained(final_dir)
+    physical_measurement = physical_monitor.close()
+    vram_measurements = build_vram_measurements(
+        logical_peak_allocated_bytes=int(torch.cuda.max_memory_allocated()),
+        logical_peak_reserved_bytes=int(torch.cuda.max_memory_reserved()),
+        allocator_backend=torch.cuda.get_allocator_backend(),
+        physical_measurement=physical_measurement,
+    )
+    summary = build_training_summary(
+        global_step=trainer.state.global_step,
+        initial_global_step=initial_global_step,
+        epoch=trainer.state.epoch,
+        learning_rate=trainer._get_learning_rate(),
+        training_loss=train_result.training_loss,
+        train_metrics=train_result.metrics,
+        vram_measurements=vram_measurements,
+    )
     (args.output_dir / "training_summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     print(json.dumps(summary, sort_keys=True))
-    final_dir = args.output_dir / "final"
-    trainer.save_model(final_dir)
-    processor.save_pretrained(final_dir)
 
 
 def main() -> None:

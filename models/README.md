@@ -22,6 +22,22 @@ hf download Qwen/Qwen3.5-27B \
 Qwen3.5-27B는 8B pipeline과 2-step smoke가 검증된 뒤에만 받는 것을 권장합니다.
 4-bit loading은 메모리에서 quantize할 뿐 원본 snapshot 다운로드 크기를 줄이지 않습니다.
 
+최종 제출 Qwen3.6-27B (Apache-2.0, pinned revision):
+
+```bash
+python -B scripts/download_weights.py \
+  --manifest configs/weights/qwen36-27b-final.manifest.json \
+  --output models/Qwen3.6-27B
+```
+
+이 경로는 29개 파일과 15개 safetensors shard의 크기·SHA-256을 검증합니다.
+최종 checkpoint-2726 adapter는 다음 명령으로 별도 설치합니다.
+
+```bash
+python -B scripts/download_final_adapter.py \
+  --output weights/qwen36-checkpoint2726
+```
+
 스냅샷 구조 예시:
 
 ```text
@@ -48,4 +64,3 @@ snu-infer --model-path models/Qwen3-VL-8B-Instruct --limit 1
 - 모델 라이선스 및 재배포 조건 확인
 - 코드와 가중치를 합친 전체 크기가 80 GB 이하인지 확인
 - 깨끗한 오프라인 환경에서 실제 로딩 및 전체 추론 완료 확인
-

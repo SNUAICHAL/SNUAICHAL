@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "final_decision": {
+    "model": "Qwen/Qwen3.6-27B",
+    "revision": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+    "checkpoint_step": 2726,
+    "epoch": 2.2869428421604616,
+    "training_rows": 9535,
+    "adapter_rank": 32,
+    "adapter_alpha": 32,
+    "adapter_sha256": "189f6c1be09bce1a9b71afeb4807b255b4c144fd2ddfc495ba0109d08ca9f1f6",
+    "model_tree_sha256": "e4107e6508793261ca372faf4b560dcb55a5b6ba79a5ab921bfe1b25a207ec07",
+    "tta_orders": ["1234", "2341", "3412", "4123"],
+    "aggregation": "hard_majority",
+    "exact_tie_break": "lexicographic",
+    "public_score": 0.93542
+  },
+  "ablation": [
+    {
+      "checkpoint": 1073,
+      "model": "Qwen3.5-27B",
+      "views": 4,
+      "aggregation": "confidence_tiebreak",
+      "public_score": 0.92844
+    },
+    {
+      "checkpoint": 1074,
+      "model": "Qwen3.6-27B",
+      "views": 4,
+      "aggregation": "confidence_tiebreak",
+      "public_score": 0.93019
+    },
+    {
+      "checkpoint": 2726,
+      "model": "Qwen3.6-27B",
+      "views": 4,
+      "aggregation": "confidence_tiebreak",
+      "public_score": 0.9267
+    },
+    {
+      "checkpoint": 2726,
+      "model": "Qwen3.6-27B",
+      "views": 4,
+      "aggregation": "hard_majority",
+      "csv_sha256": "75c4c223cd73f01e801753610bbee46e2e6b5cdb0166378b9af71ee9e29b7563",
+      "public_score": 0.93542
+    },
+    {
+      "checkpoint": 2726,
+      "model": "Qwen3.6-27B",
+      "views": 24,
+      "aggregation": "hard_majority",
+      "csv_sha256": "eaa2b3a8fa0426767c3f39b6fe98c90d0e872e18b2d656b3058eb20ef6521578",
+      "public_score": 0.93193
+    },
+    {
+      "checkpoint": 3400,
+      "model": "Qwen3.6-27B",
+      "views": 12,
+      "aggregation": "hard_majority",
+      "csv_sha256": "f142ec30c70ed796faaf6ff0bd47ac5e713f1243fffeff99d3debc3aab4edce9",
+      "public_score": 0.93542
+    }
+  ],
+  "final_inference_measurement": {
+    "rows": 819,
+    "views": 3276,
+    "parse_failures": 0,
+    "seconds_per_row": 16.46930578253969,
+    "elapsed_seconds": 13990.456025600433,
+    "physical_peak_bytes": 22710861824,
+    "physical_total_vram_bytes": 25769803776,
+    "gpu": "NVIDIA GeForce RTX 3090"
+  },
+  "source_sha256": {
+    "src/snuaichal/inference.py": "7ab46f47e6214245c19d1da9e49452bac68091bb7f29715de85ff7b8f5b3d414",
+    "src/snuaichal/tta.py": "c3a3df4f40aed77f284c4f60d2834b671e1d87b0cae4d01fc981c44f90357bc2",
+    "src/snuaichal/submission.py": "e2f9844bddc443f4a747066ef786e5891cb256f78a5a52103fd18aea6bfc71c8",
+    "src/snuaichal/modeling.py": "3fcd1e73c41ff616f229597de78b84e8174588cc153f4ec74eeca3a32b844778"
+  },
+  "external_data_used": false,
+  "commercial_api_used": false,
+  "model_ensemble_used": false,
+  "private_score_known": false
+}

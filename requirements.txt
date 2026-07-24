@@ -1,8 +1,8 @@
 # Python 3.10.20 / CUDA 12.4 reference environment
 # Install the matching CUDA build of PyTorch first when necessary:
-#   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
-torch==2.5.1
-torchvision==0.20.1
+#   pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0
+torchvision==0.21.0
 transformers==5.13.1
 accelerate==1.7.0
 peft==0.19.1
@@ -11,4 +11,6 @@ qwen-vl-utils==0.0.14
 pandas==2.2.3
 Pillow==11.1.0
 tqdm==4.67.1
-
+psutil==7.2.2
+nvidia-ml-py==13.610.43
+huggingface-hub==1.24.0

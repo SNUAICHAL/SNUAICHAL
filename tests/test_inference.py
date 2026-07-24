@@ -10,8 +10,28 @@ from snuaichal.inference import build_parser
 def test_inference_accepts_a_local_lora_adapter() -> None:
     args = build_parser().parse_args(
         [
+            "--model-path",
+            "models/Qwen3-VL-8B-Instruct",
+            "--model-repository",
+            "Qwen/Qwen3-VL-8B-Instruct",
+            "--model-family",
+            "qwen3_vl",
+            "--model-revision",
+            "revision-1",
+            "--model-manifest",
+            "outputs/model-manifest.json",
             "--adapter-path",
             "outputs/run/final",
+            "--precision",
+            "nf4",
+            "--tta",
+            "1",
+            "--tta-orders-json",
+            "[[1,2,3,4]]",
+            "--aggregation-mode",
+            "hard",
+            "--fallback-policy",
+            "identity",
             "--validation-fraction",
             "0.05",
             "--metrics-output",
@@ -28,13 +48,34 @@ def test_inference_accepts_a_local_lora_adapter() -> None:
     assert args.image_size == 512
     assert args.max_pixels is None
     assert args.tta == 1
+    assert args.tta_orders == ((1, 2, 3, 4),)
+    assert args.fallback_policy == "identity"
 
 
 def test_inference_accepts_explicit_precision_and_manifest() -> None:
     args = build_parser().parse_args(
         [
+            "--model-path",
+            "models/Qwen3-VL-8B-Instruct",
+            "--model-repository",
+            "Qwen/Qwen3-VL-8B-Instruct",
+            "--model-family",
+            "qwen3_vl",
+            "--model-revision",
+            "revision-1",
+            "--model-manifest",
+            "outputs/model-manifest.json",
+            "--no-adapter",
             "--precision",
             "bf16",
+            "--tta",
+            "1",
+            "--tta-orders-json",
+            "[[1,2,3,4]]",
+            "--aggregation-mode",
+            "hard",
+            "--fallback-policy",
+            "identity",
             "--validation-manifest",
             "outputs/run/split_manifest.json",
         ]
@@ -42,6 +83,41 @@ def test_inference_accepts_explicit_precision_and_manifest() -> None:
 
     assert args.precision == "bf16"
     assert args.validation_manifest == Path("outputs/run/split_manifest.json")
+
+
+@pytest.mark.parametrize(
+    "omitted_flag",
+    (
+        "--model-path",
+        "--model-repository",
+        "--model-family",
+        "--model-revision",
+        "--model-manifest",
+        "--precision",
+        "--tta",
+        "--aggregation-mode",
+    ),
+)
+def test_inference_rejects_implicit_identity_or_runtime_settings(
+    omitted_flag: str,
+) -> None:
+    arguments = {
+        "--model-path": "models/Qwen3-VL-8B-Instruct",
+        "--model-repository": "Qwen/Qwen3-VL-8B-Instruct",
+        "--model-family": "qwen3_vl",
+        "--model-revision": "revision-1",
+        "--model-manifest": "outputs/model-manifest.json",
+        "--precision": "nf4",
+        "--tta": "1",
+        "--aggregation-mode": "hard",
+    }
+    argv = ["--no-adapter"]
+    for flag, value in arguments.items():
+        if flag != omitted_flag:
+            argv.extend([flag, value])
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(argv)
 
 
 def test_manifest_validation_rows_follow_manifest_order(tmp_path: Path) -> None:
@@ -82,6 +158,7 @@ def test_nf4_and_bf16_model_loading_arguments_are_mutually_explicit() -> None:
         dtype="bf16",
         device_map="auto",
         local_files_only=True,
+        attn_implementation="sdpa",
         quantization_config=quantization_config,
     )
     bf16 = inference.build_model_load_kwargs(
@@ -89,9 +166,11 @@ def test_nf4_and_bf16_model_loading_arguments_are_mutually_explicit() -> None:
         dtype="bf16",
         device_map="auto",
         local_files_only=True,
+        attn_implementation="sdpa",
     )
 
     assert nf4["device_map"] == {"": 0}
+    assert nf4["attn_implementation"] == "sdpa"
     assert nf4["quantization_config"] is quantization_config
     assert bf16["device_map"] == "auto"
     assert "quantization_config" not in bf16
@@ -101,7 +180,19 @@ def test_nf4_and_bf16_model_loading_arguments_are_mutually_explicit() -> None:
             dtype="bf16",
             device_map="auto",
             local_files_only=True,
+            attn_implementation="sdpa",
         )
+
+
+def test_inference_parser_exposes_only_supported_attention_backend() -> None:
+    parser = inference.build_parser()
+
+    action = next(
+        action for action in parser._actions if action.dest == "attn_implementation"
+    )
+
+    assert action.default == "sdpa"
+    assert action.choices == ("sdpa",)
 
 
 @pytest.mark.parametrize(
@@ -135,3 +226,43 @@ def test_inference_canonicalizes_a_view_with_keyword_only_tta_api() -> None:
         [2, 4, 1, 3], (2, 3, 4, 1)
     ) == [3, 2, 4, 1]
     assert inference.canonicalize_view_result(None, (2, 3, 4, 1)) is None
+
+
+def test_resume_progress_round_trip_requires_canonical_prefix(tmp_path: Path) -> None:
+    output = tmp_path / "submission.csv"
+    audit = tmp_path / "audit.jsonl"
+    predictions = [{"Id": "a", "Answer": "[1, 2, 3, 4]"}]
+    audit_rows = [{"Id": "a", "parse_ok": True, "views": []}]
+
+    inference._atomic_write_progress(
+        output=output,
+        audit_log=audit,
+        predictions=predictions,
+        audit_rows=audit_rows,
+    )
+
+    loaded_predictions, loaded_audit = inference._load_resume_prefix(
+        output=output,
+        audit_log=audit,
+        expected_ids=["a", "b"],
+    )
+    assert loaded_predictions == predictions
+    assert loaded_audit == audit_rows
+    with pytest.raises(RuntimeError, match="canonical"):
+        inference._load_resume_prefix(
+            output=output,
+            audit_log=audit,
+            expected_ids=["wrong", "b"],
+        )
+
+
+def test_resume_progress_rejects_unpaired_files(tmp_path: Path) -> None:
+    output = tmp_path / "submission.csv"
+    output.write_text("Id,Answer\na,\"[1, 2, 3, 4]\"\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="both"):
+        inference._load_resume_prefix(
+            output=output,
+            audit_log=tmp_path / "missing.jsonl",
+            expected_ids=["a"],
+        )
