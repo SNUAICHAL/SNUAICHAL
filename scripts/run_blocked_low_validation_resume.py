@@ -79,8 +79,8 @@ BASELINE_REPORT = RESUME_ROOT / "baseline-report-v2.json"
 PRESERVED_MANIFEST = RESUME_ROOT / "preserved-inputs-manifest.json"
 FULL_OPTIMIZER_STEPS = 6438
 MAX_PROJECTED_HOURS = 72.0
-MAX_SAFE_VRAM_BYTES = 22 * 1024**3
-PHYSICAL_VRAM_BYTES = 24 * 1024**3
+FINAL_RTX3090_MAX_SAFE_VRAM_BYTES = 22 * 1024**3
+FINAL_RTX3090_PHYSICAL_VRAM_BYTES = 24 * 1024**3
 MAX_PACKAGE_BYTES = 80_000_000_000
 PROVENANCE_SCHEMA_VERSION = 2
 
@@ -436,6 +436,12 @@ def build_final_test_inference_stage(
                 "inference_seconds_per_sample",
                 "estimated_test_seconds",
                 "peak_vram_mib",
+                "logical_peak_allocated_bytes",
+                "logical_peak_reserved_bytes",
+                "physical_measurement_status",
+                "physical_total_vram_bytes",
+                "physical_peak_observed_bytes",
+                "physical_measurement_source",
                 "model_precision",
                 "detected_model_family",
                 "declared_model_family",
@@ -478,6 +484,17 @@ def build_final_test_inference_stage(
             ):
                 if not _finite_number(metrics.get(field), positive=True):
                     errors.append(f"{field} must be finite and positive")
+            physical_peak = metrics.get("physical_peak_observed_bytes")
+            if metrics.get("physical_measurement_status") != "valid":
+                errors.append("final inference physical VRAM measurement is not valid")
+            if metrics.get("physical_total_vram_bytes") != FINAL_RTX3090_PHYSICAL_VRAM_BYTES:
+                errors.append("final inference did not run on a 24 GiB RTX 3090 profile")
+            if (
+                isinstance(physical_peak, bool)
+                or not isinstance(physical_peak, int)
+                or not 0 <= physical_peak <= FINAL_RTX3090_MAX_SAFE_VRAM_BYTES
+            ):
+                errors.append("final inference physical VRAM peak exceeds 22 GiB")
             if runtime.get("quantization_applied") is not (
                 selection["precision"] == "nf4"
             ):
@@ -1760,9 +1777,16 @@ def inference_validator(
             ):
                 if not _finite_number(metrics.get(field), positive=True):
                     errors.append(f"{field} must be finite and positive")
-            peak_mib = metrics.get("peak_vram_mib")
-            if _finite_number(peak_mib, positive=True) and float(peak_mib) * 1024**2 > PHYSICAL_VRAM_BYTES:
-                errors.append("peak_vram_mib exceeds physical VRAM")
+            physical_peak = metrics.get("physical_peak_observed_bytes")
+            if metrics.get("physical_measurement_status") != "valid":
+                errors.append("physical inference VRAM measurement is not valid")
+            if (
+                isinstance(physical_peak, bool)
+                or not isinstance(physical_peak, int)
+                or physical_peak < 0
+                or physical_peak > FINAL_RTX3090_MAX_SAFE_VRAM_BYTES
+            ):
+                errors.append("physical inference VRAM peak exceeds 22 GiB")
             parse_failures = 0
             exact_matches = 0
             non_identity_total = 0
@@ -2932,7 +2956,7 @@ def run(*, poll_seconds: float) -> dict[str, Any]:
         "vram_safe": (
             physical_valid
             and isinstance(physical_peak, int)
-            and physical_peak <= MAX_SAFE_VRAM_BYTES
+            and physical_peak <= FINAL_RTX3090_MAX_SAFE_VRAM_BYTES
         ),
         "runtime_acceptable": projected_seconds <= MAX_PROJECTED_HOURS * 3600,
         "package_under_80gb": package_bytes <= MAX_PACKAGE_BYTES,

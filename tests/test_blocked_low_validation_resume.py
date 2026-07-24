@@ -10,6 +10,17 @@ import pytest
 from scripts import run_blocked_low_validation_resume as resume
 
 
+@pytest.fixture(autouse=True)
+def _clean_clone_preserved_manifest(monkeypatch, tmp_path: Path) -> None:
+    """Keep provenance tests independent of ignored, machine-local outputs."""
+    manifest = tmp_path / "empty-preserved-inputs-manifest.json"
+    manifest.write_text(
+        json.dumps({"file_count": 0, "files": []}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(resume, "PRESERVED_MANIFEST", manifest)
+
+
 def test_direct_script_entrypoint_resolves_project_imports() -> None:
     environment = dict(os.environ)
     environment["PYTHONPATH"] = str(resume.ROOT / "src")
@@ -329,6 +340,12 @@ def test_final_test_inference_stage_freezes_identity_and_validates_819_rows(
                 "inference_seconds_per_sample": 1.0,
                 "estimated_test_seconds": 819.0,
                 "peak_vram_mib": 1024.0,
+                "logical_peak_allocated_bytes": 1024 * 1024**2,
+                "logical_peak_reserved_bytes": 1280 * 1024**2,
+                "physical_measurement_status": "valid",
+                "physical_total_vram_bytes": 24 * 1024**3,
+                "physical_peak_observed_bytes": 20 * 1024**3,
+                "physical_measurement_source": "nvml_per_process_used_bytes",
                 "model_precision": "nf4",
                 "model_family": "qwen3_vl",
                 "detected_model_family": "qwen3_vl",
@@ -614,7 +631,7 @@ def test_paired_gate_accepts_any_strict_non_identity_improvement() -> None:
         ("train_steps_per_second", float("nan")),
         ("seconds_per_optimizer_step", -1.0),
         ("peak_vram_bytes", 0),
-        ("peak_vram_bytes", resume.PHYSICAL_VRAM_BYTES + 1),
+        ("peak_vram_bytes", resume.FINAL_RTX3090_PHYSICAL_VRAM_BYTES + 1),
     ],
 )
 def test_training_validator_rejects_impossible_smoke_metrics(
@@ -1694,6 +1711,8 @@ def _write_valid_inference_attempt(attempt: Path, manifest: Path) -> None:
                 "inference_seconds_per_sample": 1.0,
                 "estimated_test_seconds": 819.0,
                 "peak_vram_mib": 1024.0,
+                "physical_measurement_status": "valid",
+                "physical_peak_observed_bytes": 20 * 1024**3,
                 "model_precision": "nf4",
                 "model_family": "qwen3_vl",
                 "detected_model_family": "qwen3_vl",

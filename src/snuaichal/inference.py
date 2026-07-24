@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import ast
+import csv
 import json
+import os
 import random
 import time
 from collections import Counter
@@ -30,6 +32,67 @@ from snuaichal.tta import (
 )
 
 REQUIRED_COLUMNS = {"Id", "Sentence", "Input_1", "Input_2", "Input_3", "Input_4"}
+
+
+def _atomic_write_progress(
+    *,
+    output: Path,
+    audit_log: Path,
+    predictions: list[dict[str, str]],
+    audit_rows: list[dict[str, Any]],
+) -> None:
+    """Persist a matched row prefix so interrupted inference can resume safely."""
+    if len(predictions) != len(audit_rows):
+        raise RuntimeError("prediction/audit progress length mismatch")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    audit_log.parent.mkdir(parents=True, exist_ok=True)
+    output_tmp = output.with_name(f"{output.name}.part-{os.getpid()}")
+    audit_tmp = audit_log.with_name(f"{audit_log.name}.part-{os.getpid()}")
+    with output_tmp.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["Id", "Answer"])
+        writer.writeheader()
+        writer.writerows(predictions)
+        handle.flush()
+        os.fsync(handle.fileno())
+    with audit_tmp.open("w", encoding="utf-8", newline="\n") as handle:
+        for row in audit_rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(output_tmp, output)
+    os.replace(audit_tmp, audit_log)
+
+
+def _load_resume_prefix(
+    *,
+    output: Path,
+    audit_log: Path,
+    expected_ids: list[str],
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    """Load only an exact canonical-ID prefix; reject unrelated cached rows."""
+    if output.exists() != audit_log.exists():
+        raise RuntimeError("resume requires both prediction and audit progress files")
+    if not output.exists():
+        return [], []
+    with output.open("r", encoding="utf-8", newline="") as handle:
+        predictions = [dict(row) for row in csv.DictReader(handle)]
+    audit_rows = [
+        json.loads(line)
+        for line in audit_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if len(predictions) != len(audit_rows):
+        raise RuntimeError("resume prediction/audit progress is not atomic")
+    ids = [str(row.get("Id")) for row in predictions]
+    audit_ids = [str(row.get("Id")) for row in audit_rows]
+    if ids != audit_ids or ids != expected_ids[: len(ids)]:
+        raise RuntimeError("resume rows are not the canonical expected-ID prefix")
+    validate_submission_records(
+        predictions,
+        expected_ids=expected_ids[: len(predictions)],
+        expected_count=len(predictions),
+    )
+    return predictions, audit_rows
 
 
 def parse_tta_orders_json(value: str) -> tuple[tuple[int, ...], ...]:
@@ -131,6 +194,7 @@ def build_model_load_kwargs(
     dtype: Any,
     device_map: Any,
     local_files_only: bool,
+    attn_implementation: str,
     quantization_config: Any = None,
 ) -> dict[str, Any]:
     """Build auditable NF4/BF16 loader arguments without an implicit fallback."""
@@ -140,7 +204,7 @@ def build_model_load_kwargs(
         "dtype": dtype,
         "device_map": {"": 0} if precision == "nf4" else device_map,
         "local_files_only": local_files_only,
-        "attn_implementation": "sdpa",
+        "attn_implementation": attn_implementation,
     }
     if precision == "nf4":
         if quantization_config is None:
@@ -321,6 +385,41 @@ def canonicalize_view_result(
     return canonicalize_view_prediction(view_prediction, view_order=view_order)
 
 
+def build_inference_memory_metrics(
+    *,
+    logical_peak_allocated_bytes: int,
+    logical_peak_reserved_bytes: int,
+    physical_measurement: dict[str, Any],
+) -> dict[str, Any]:
+    """Record allocator and independently sampled physical VRAM without conflation."""
+    for name, value in (
+        ("logical_peak_allocated_bytes", logical_peak_allocated_bytes),
+        ("logical_peak_reserved_bytes", logical_peak_reserved_bytes),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+    if logical_peak_allocated_bytes > logical_peak_reserved_bytes:
+        raise ValueError("logical peak allocated bytes cannot exceed reserved bytes")
+    protected = {
+        "peak_vram_mib",
+        "logical_peak_allocated_bytes",
+        "logical_peak_reserved_bytes",
+    }
+    collisions = protected.intersection(physical_measurement)
+    if collisions:
+        raise ValueError(
+            "physical measurement cannot overwrite allocator metrics: "
+            f"{sorted(collisions)}"
+        )
+    return {
+        "peak_vram_mib": logical_peak_allocated_bytes / (1024 * 1024),
+        "logical_peak_allocated_bytes": logical_peak_allocated_bytes,
+        "logical_peak_reserved_bytes": logical_peak_reserved_bytes,
+        "physical_memory_schema_version": physical_measurement.get("schema_version"),
+        **{key: value for key, value in physical_measurement.items() if key != "schema_version"},
+    }
+
+
 def run(args: argparse.Namespace) -> None:
     """Run deterministic inference and write both submission and audit logs."""
     try:
@@ -341,6 +440,7 @@ def run(args: argparse.Namespace) -> None:
         detect_model_family,
         resolve_model_class,
     )
+    from snuaichal.physical_memory import ExternalPhysicalMemoryMonitor
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -397,6 +497,10 @@ def run(args: argparse.Namespace) -> None:
         test_df = test_df.head(args.limit)
 
     precision = resolve_precision(args)
+    physical_monitor = None
+    if torch.cuda.is_available():
+        physical_monitor = ExternalPhysicalMemoryMonitor(args.metrics_output.parent)
+        physical_monitor.start()
     dtype = torch.bfloat16 if precision == "bf16" else _resolve_dtype(torch, args.dtype)
     config = AutoConfig.from_pretrained(
         args.model_path, local_files_only=not args.allow_network
@@ -413,6 +517,7 @@ def run(args: argparse.Namespace) -> None:
         dtype=dtype,
         device_map=args.device_map,
         local_files_only=not args.allow_network,
+        attn_implementation=args.attn_implementation,
         quantization_config=(
             create_4bit_config(torch, transformers) if precision == "nf4" else None
         ),
@@ -436,8 +541,20 @@ def run(args: argparse.Namespace) -> None:
     model.config.use_cache = True
     runtime_state = collect_model_runtime_state(model, torch, precision=precision)
 
-    predictions: list[dict[str, str]] = []
-    audit_rows: list[dict[str, Any]] = []
+    expected_ids = [str(sample_id) for sample_id in test_df["Id"].tolist()]
+    if args.resume and (
+        args.validation_manifest is not None or args.validation_fraction is not None
+    ):
+        raise ValueError("row-resume is supported only for unlabeled test inference")
+    predictions, audit_rows = (
+        _load_resume_prefix(
+            output=args.output,
+            audit_log=args.audit_log,
+            expected_ids=expected_ids,
+        )
+        if args.resume
+        else ([], [])
+    )
     metric_predictions: list[list[int] | None] = []
     metric_predictions_by_mode: dict[str, list[list[int] | None]] = {
         mode: [] for mode in ("hard", "confidence_tiebreak", "confidence_weighted")
@@ -447,9 +564,19 @@ def run(args: argparse.Namespace) -> None:
     metric_no_ordering: list[bool] = []
     metric_tta_patterns: list[str] = []
     tta_consistency: list[bool] = []
-    all_image_grids: list[list[int]] = []
-    all_visual_tokens: list[int] = []
-    parse_failures = 0
+    all_image_grids: list[list[int]] = [
+        grid
+        for audit in audit_rows
+        for view in audit.get("views", [])
+        for grid in view.get("image_grid_thw", [])
+    ]
+    all_visual_tokens: list[int] = [
+        token
+        for audit in audit_rows
+        for view in audit.get("views", [])
+        for token in view.get("visual_tokens", [])
+    ]
+    parse_failures = sum(not bool(row.get("parse_ok")) for row in audit_rows)
     tta_orders = (
         args.tta_orders
         if args.tta_orders is not None
@@ -465,7 +592,13 @@ def run(args: argparse.Namespace) -> None:
         torch.cuda.reset_peak_memory_stats()
     inference_started = time.perf_counter()
 
-    for _, row in tqdm(test_df.iterrows(), total=len(test_df), desc="Inference"):
+    pending_df = test_df.iloc[len(predictions) :]
+    for _, row in tqdm(
+        pending_df.iterrows(),
+        total=len(test_df),
+        initial=len(predictions),
+        desc="Inference",
+    ):
         view_audit = []
         canonical_predictions: list[list[int] | None] = []
         view_confidences: list[float | None] = []
@@ -568,27 +701,48 @@ def run(args: argparse.Namespace) -> None:
                 "views": view_audit,
             }
         )
+        _atomic_write_progress(
+            output=args.output,
+            audit_log=args.audit_log,
+            predictions=predictions,
+            audit_rows=audit_rows,
+        )
 
     elapsed_seconds = time.perf_counter() - inference_started
-    expected_ids = [str(sample_id) for sample_id in test_df["Id"].tolist()]
     validate_submission_records(
         predictions,
         expected_ids=expected_ids,
         expected_count=len(expected_ids),
     )
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(predictions, columns=["Id", "Answer"]).to_csv(
-        args.output, index=False, encoding="utf-8"
+    _atomic_write_progress(
+        output=args.output,
+        audit_log=args.audit_log,
+        predictions=predictions,
+        audit_rows=audit_rows,
     )
-    args.audit_log.parent.mkdir(parents=True, exist_ok=True)
-    with args.audit_log.open("w", encoding="utf-8", newline="\n") as log_file:
-        for row in audit_rows:
-            log_file.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     print(f"Saved {len(predictions)} predictions to {args.output}")
     print(f"Parse failures: {parse_failures}/{len(predictions)}")
-    peak_vram_bytes = (
+    peak_allocated_bytes = (
         torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+    )
+    peak_reserved_bytes = (
+        torch.cuda.max_memory_reserved() if torch.cuda.is_available() else 0
+    )
+    physical_measurement = (
+        physical_monitor.close()
+        if physical_monitor is not None
+        else {
+            "physical_measurement_status": "not_applicable",
+            "physical_peak_observed_bytes": None,
+            "physical_total_vram_bytes": None,
+            "physical_measurement_source": None,
+        }
+    )
+    memory_metrics = build_inference_memory_metrics(
+        logical_peak_allocated_bytes=peak_allocated_bytes,
+        logical_peak_reserved_bytes=peak_reserved_bytes,
+        physical_measurement=physical_measurement,
     )
     seconds_per_sample = elapsed_seconds / len(predictions)
     metrics: dict[str, Any] = {
@@ -597,7 +751,7 @@ def run(args: argparse.Namespace) -> None:
         "parse_failure_rate": parse_failures / len(predictions),
         "inference_seconds_per_sample": seconds_per_sample,
         "estimated_test_seconds": seconds_per_sample * 819,
-        "peak_vram_mib": peak_vram_bytes / (1024 * 1024),
+        **memory_metrics,
         "model_precision": precision,
     }
     if metric_references:
@@ -614,7 +768,7 @@ def run(args: argparse.Namespace) -> None:
                 no_ordering=metric_no_ordering or None,
                 tta_agreement_patterns=metric_tta_patterns,
                 elapsed_seconds=elapsed_seconds,
-                peak_vram_bytes=peak_vram_bytes,
+                peak_vram_bytes=peak_allocated_bytes,
                 model_precision=precision,
                 image_grid_thw=all_image_grids,
                 visual_tokens=all_visual_tokens,
@@ -762,8 +916,19 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     parser.add_argument("--device-map", default="auto")
+    parser.add_argument(
+        "--attn-implementation",
+        choices=("sdpa",),
+        default="sdpa",
+        help="Explicit deterministic attention backend",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--limit", type=int, help="Smoke-test only the first N rows")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume an exact canonical-ID prediction/audit prefix",
+    )
     parser.add_argument(
         "--allow-network",
         action="store_true",

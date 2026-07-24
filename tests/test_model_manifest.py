@@ -180,3 +180,18 @@ def test_unlisted_model_file_fails(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="missing or unlisted"):
         _verify(root, manifest_path)
+
+
+def test_portable_manifest_accepts_a_different_verified_root(tmp_path: Path) -> None:
+    root, manifest_path, _ = _create(tmp_path)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["local_model_path"] = "<portable>"
+    unsigned = {key: value for key, value in payload.items() if key != "manifest_sha256"}
+    payload["manifest_sha256"] = hashlib.sha256(
+        _canonical_json(unsigned).encode()
+    ).hexdigest()
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    verified = _verify(root, manifest_path)
+
+    assert verified["local_model_path"] == "<portable>"

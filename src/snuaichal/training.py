@@ -4,17 +4,11 @@ from __future__ import annotations
 
 import argparse
 import ast
-import atexit
 import csv
 import itertools
 import json
-import os
 import random
-import subprocess
-import sys
-import time
 from collections import Counter
-from datetime import datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Callable
@@ -22,7 +16,7 @@ from typing import Any, Callable
 from snuaichal.augmentation import DatasetEpochCallback, EpochShuffleDataset
 from snuaichal.inference import build_messages
 from snuaichal.modeling import ModelFamily, apply_model_chat_template
-from snuaichal.physical_memory import command_identity
+from snuaichal.physical_memory import ExternalPhysicalMemoryMonitor
 from snuaichal.scheduling import (
     HorizonTrainer,
     StopAtStepCallback,
@@ -578,80 +572,6 @@ def build_vram_measurements(
         result["continuation_gate_source"] = None
         result["continuation_gate_bytes"] = None
     return result
-
-
-class ExternalPhysicalMemoryMonitor:
-    """Run the narrow NVML sampler before model load and finalize it after work."""
-
-    def __init__(self, output_dir: Path, *, interval_seconds: float = 0.5) -> None:
-        self.output_dir = output_dir
-        self.interval_seconds = interval_seconds
-        self.ready_path = output_dir / ".physical-monitor-ready"
-        self.done_path = output_dir / ".physical-monitor-done"
-        self.report_path = output_dir / "physical_memory_measurement.json"
-        self.process: subprocess.Popen[bytes] | None = None
-        self._closed = False
-
-    def start(self) -> None:
-        import psutil
-
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        parent = psutil.Process(os.getpid())
-        command = [
-            sys.executable,
-            "-m",
-            "snuaichal.physical_memory",
-            "--parent-pid",
-            str(os.getpid()),
-            "--expected-create-time",
-            str(parent.create_time()),
-            "--expected-command-identity",
-            command_identity(parent.cmdline()),
-            "--ready-path",
-            str(self.ready_path),
-            "--done-path",
-            str(self.done_path),
-            "--report-path",
-            str(self.report_path),
-            "--sample-interval-seconds",
-            str(self.interval_seconds),
-        ]
-        self.process = subprocess.Popen(
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
-        )
-        deadline = time.monotonic() + 15.0
-        while not self.ready_path.is_file():
-            if self.process.poll() is not None or time.monotonic() >= deadline:
-                raise RuntimeError("physical memory monitor did not become ready")
-            time.sleep(0.05)
-        atexit.register(self.close)
-
-    def close(self) -> dict[str, Any]:
-        if self._closed:
-            return json.loads(self.report_path.read_text(encoding="utf-8"))
-        self._closed = True
-        self.done_path.write_text(
-            datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8"
-        )
-        if self.process is not None:
-            try:
-                self.process.wait(timeout=max(15.0, self.interval_seconds * 10))
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
-        deadline = time.monotonic() + 5.0
-        while not self.report_path.is_file() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        try:
-            atexit.unregister(self.close)
-        except Exception:
-            pass
-        if not self.report_path.is_file():
-            raise RuntimeError("physical memory monitor report is missing")
-        return json.loads(self.report_path.read_text(encoding="utf-8"))
 
 
 def build_training_summary(
