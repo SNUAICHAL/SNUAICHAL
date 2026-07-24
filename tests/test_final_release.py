@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import io
 import json
+import subprocess
 import tarfile
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import pytest
 from scripts.download_final_adapter import (
     acquire_adapter,
     canonical_json,
+    download_archive,
     load_manifest,
 )
 from scripts.run_final_inference import LATIN4, build_command
@@ -78,6 +80,46 @@ def test_adapter_manifest_rejects_self_hash_drift(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="self SHA-256"):
         load_manifest(manifest_path)
+
+
+def test_private_github_release_download_uses_authenticated_gh(
+    monkeypatch, tmp_path: Path
+) -> None:
+    destination = tmp_path / "adapter.tar.gz"
+    manifest = {
+        "repository": "example/private",
+        "release_tag": "final-v1",
+        "download_url": (
+            "https://github.com/example/private/releases/download/"
+            "final-v1/adapter.tar.gz"
+        ),
+    }
+    observed: list[str] = []
+
+    def fake_run(command: list[str], *, check: bool) -> subprocess.CompletedProcess:
+        observed.extend(command)
+        assert check is True
+        destination.write_bytes(b"downloaded")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr("scripts.download_final_adapter.shutil.which", lambda _: "gh")
+    monkeypatch.setattr("scripts.download_final_adapter.subprocess.run", fake_run)
+
+    download_archive(manifest, destination)
+
+    assert destination.read_bytes() == b"downloaded"
+    assert observed == [
+        "gh",
+        "release",
+        "download",
+        "final-v1",
+        "--repo",
+        "example/private",
+        "--pattern",
+        "adapter.tar.gz",
+        "--output",
+        str(destination),
+    ]
 
 
 def test_final_inference_command_is_frozen_to_latin4_hard(tmp_path: Path) -> None:

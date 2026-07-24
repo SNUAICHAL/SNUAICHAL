@@ -136,6 +136,9 @@ adapter는 GitHub Release asset으로 제공됩니다. downloader는 archive의
 `f89df01d00d3b4808881abd2abb2d48df35213c1b1506dd856ac66c62cd5a054`
 및 내부 두 파일을 모두 검증한 뒤 설치합니다.
 
+저장소가 private인 동안에는 먼저 `gh auth login`으로 collaborator 계정을
+인증하거나 `GH_TOKEN`/`GITHUB_TOKEN`을 설정해야 합니다.
+
 ```bash
 python -B scripts/download_final_adapter.py \
   --output weights/qwen36-checkpoint2726

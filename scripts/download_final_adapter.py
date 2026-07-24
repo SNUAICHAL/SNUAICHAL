@@ -5,8 +5,11 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import tarfile
 import tempfile
+import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -125,6 +128,42 @@ def safe_extract(archive: Path, destination: Path) -> None:
                 shutil.copyfileobj(source, handle)
 
 
+def download_archive(manifest: dict[str, Any], destination: Path) -> None:
+    """Download a public asset or authenticate to a private GitHub release."""
+    url = str(manifest["download_url"])
+    parsed = urllib.parse.urlparse(url)
+    if parsed.netloc == "github.com" and shutil.which("gh") is not None:
+        subprocess.run(
+            [
+                "gh",
+                "release",
+                "download",
+                str(manifest["release_tag"]),
+                "--repo",
+                str(manifest["repository"]),
+                "--pattern",
+                PurePosixPath(parsed.path).name,
+                "--output",
+                str(destination),
+            ],
+            check=True,
+        )
+        return
+    headers = {"User-Agent": "SNUAICHAL-reproducibility-downloader"}
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request) as response, destination.open("xb") as output:
+            shutil.copyfileobj(response, output)
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            "adapter download failed; for a private repository run `gh auth login` "
+            "or set GH_TOKEN/GITHUB_TOKEN"
+        ) from exc
+
+
 def acquire_adapter(
     manifest_path: Path,
     output: Path,
@@ -139,7 +178,7 @@ def acquire_adapter(
         temporary = Path(temporary_text)
         archive = temporary / "adapter.tar.gz"
         if archive_override is None:
-            urllib.request.urlretrieve(str(manifest["download_url"]), archive)
+            download_archive(manifest, archive)
         else:
             shutil.copyfile(archive_override, archive)
         if archive.stat().st_size != int(manifest["archive_size_bytes"]):
