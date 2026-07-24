@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from snuaichal.physical_memory import (
+    _nvml_handle_for_visible_device,
     _valid_used_bytes,
     command_identity,
     cuda_workload_identity,
@@ -212,6 +213,38 @@ def test_training_row_limit_applies_after_the_full_dataset_split() -> None:
     assert validation_rows == full_validation[:2]
 
 
+def test_zero_validation_fraction_uses_all_rows_for_final_training() -> None:
+    rows = [{"Id": f"sample-{index}"} for index in range(5)]
+
+    train_rows, validation_rows = select_training_rows(
+        rows,
+        image_dir=Path("unused"),
+        validation_fraction=0.0,
+        seed=42,
+        limit=None,
+        clean_validation=True,
+    )
+
+    assert train_rows == rows
+    assert validation_rows == []
+
+
+def test_zero_validation_fraction_honors_smoke_limit() -> None:
+    rows = [{"Id": f"sample-{index}"} for index in range(5)]
+
+    train_rows, validation_rows = select_training_rows(
+        rows,
+        image_dir=Path("unused"),
+        validation_fraction=0.0,
+        seed=42,
+        limit=2,
+        clean_validation=True,
+    )
+
+    assert train_rows == rows[:2]
+    assert validation_rows == []
+
+
 def test_training_defaults_fit_a_single_24gb_gpu() -> None:
     args = build_parser().parse_args([])
 
@@ -223,12 +256,20 @@ def test_training_defaults_fit_a_single_24gb_gpu() -> None:
     assert args.balance_inputs is True
     assert args.clean_validation is True
     assert args.validation_fraction == 0.1
+    assert args.save_total_limit is None
 
     training_kwargs = build_training_argument_kwargs(args, bf16=True)
     assert training_kwargs["eval_strategy"] == "no"
     assert training_kwargs["save_total_limit"] is None
     assert training_kwargs["lr_scheduler_type"] == "cosine"
     assert training_kwargs["max_steps"] == -1
+
+
+def test_training_rejects_nonpositive_save_total_limit() -> None:
+    args = build_parser().parse_args(["--save-total-limit", "0"])
+
+    with pytest.raises(ValueError, match="positive integer"):
+        build_training_argument_kwargs(args, bf16=True)
 
 
 def test_training_summary_records_optimizer_step_timing() -> None:
@@ -614,3 +655,24 @@ def test_run_manifest_rejects_incompatible_resume_settings(tmp_path: Path) -> No
 
     with pytest.raises(ValueError, match="does not match"):
         write_or_validate_manifest(path, {"scheduler_horizon_steps": 4292})
+class _FakeNvml:
+    def nvmlDeviceGetHandleByIndex(self, index: int) -> tuple[str, int]:
+        return ("index", index)
+
+    def nvmlDeviceGetHandleByUUID(self, value: str) -> tuple[str, str]:
+        return ("uuid", value)
+
+    def nvmlDeviceGetHandleByPciBusId(self, value: str) -> tuple[str, str]:
+        return ("pci", value)
+
+
+def test_physical_monitor_respects_scheduler_visible_device(monkeypatch) -> None:
+    nvml = _FakeNvml()
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+    assert _nvml_handle_for_visible_device(nvml) == ("index", 3)
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-assigned")
+    assert _nvml_handle_for_visible_device(nvml) == ("uuid", "GPU-assigned")
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0000:65:00.0")
+    assert _nvml_handle_for_visible_device(nvml) == ("pci", "0000:65:00.0")

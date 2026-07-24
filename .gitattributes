@@ -5,4 +5,4 @@
 *.yaml text eol=lf
 *.json text eol=lf
 *.ipynb text eol=lf
-
+*.pdf binary

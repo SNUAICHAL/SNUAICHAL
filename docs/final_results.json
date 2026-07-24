@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "final_decision": {
     "model": "Qwen/Qwen3.6-27B",
     "revision": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
@@ -66,8 +66,9 @@
     "rows": 819,
     "views": 3276,
     "parse_failures": 0,
-    "seconds_per_row": 16.46930578253969,
-    "elapsed_seconds": 13990.456025600433,
+    "generation_seconds_per_row": 16.46930578253969,
+    "generation_loop_seconds": 13488.361435900006,
+    "end_to_end_elapsed_seconds": 13990.456025600433,
     "physical_peak_bytes": 22710861824,
     "physical_total_vram_bytes": 25769803776,
     "gpu": "NVIDIA GeForce RTX 3090"
@@ -78,7 +79,15 @@
     "src/snuaichal/submission.py": "e2f9844bddc443f4a747066ef786e5891cb256f78a5a52103fd18aea6bfc71c8",
     "src/snuaichal/modeling.py": "3fcd1e73c41ff616f229597de78b84e8174588cc153f4ec74eeca3a32b844778"
   },
-  "external_data_used": false,
+  "release_source_sha256": {
+    "configs/final_inference.json": "8a41669e0920d4096fa195913c6f7104460e4fb6fa494e6bd9d2cfadfca2d184",
+    "scripts/run_final_inference.py": "4c1c7caeff1393babba13ba5ed85334f43b1b4561e48d3d24c72802a6d030701",
+    "scripts/validate_submission_artifacts.py": "356255a008f1779568007564956c643c8032d2f5c81850ee8c2554fdeb14e469",
+    "scripts/verify_evaluation_package.py": "ec8c19c8388339eca9db7efeed6b987a82c17a2a69ed8fd79cd2e2d98dc29aa3",
+    "src/snuaichal/physical_memory.py": "36d578051f1c7895e7d5a15c9796666b9b6d2ed5a2ce4c26d81694e497a24324"
+  },
+  "external_training_or_tuning_data_used": false,
+  "official_external_eval_inference_performed_at_freeze": false,
   "commercial_api_used": false,
   "model_ensemble_used": false,
   "private_score_known": false

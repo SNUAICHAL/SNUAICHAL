@@ -159,6 +159,15 @@ def select_training_rows(
     clean_validation: bool,
 ) -> tuple[list[Any], list[Any]]:
     """Apply the production split to all rows before limiting each partition."""
+    if validation_fraction == 0.0:
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be positive")
+        selected = list(rows if limit is None else rows[:limit])
+        if not selected:
+            raise ValueError("full-data training selection is empty")
+        return selected, []
+    if not 0.0 < validation_fraction < 1.0:
+        raise ValueError("validation_fraction must be in [0, 1)")
     if clean_validation:
         train_rows, validation_rows = split_rows_without_image_overlap(
             rows,
@@ -374,6 +383,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--stop-after-steps", type=int, default=4292)
     parser.add_argument("--save-steps", type=int, default=1073)
+    parser.add_argument(
+        "--save-total-limit",
+        type=int,
+        help="Retain at most this many complete checkpoints (unset keeps all)",
+    )
     parser.add_argument("--logging-steps", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--load-in-4bit", action="store_true")
@@ -460,6 +474,8 @@ def build_training_argument_kwargs(
     args: argparse.Namespace, bf16: bool
 ) -> dict[str, Any]:
     """Build Trainer settings while reserving validation for exact-match inference."""
+    if args.save_total_limit is not None and args.save_total_limit <= 0:
+        raise ValueError("--save-total-limit must be a positive integer")
     return {
         "output_dir": str(args.output_dir),
         "num_train_epochs": args.epochs,
@@ -474,7 +490,7 @@ def build_training_argument_kwargs(
         "eval_strategy": "no",
         "save_strategy": "steps",
         "save_steps": args.save_steps,
-        "save_total_limit": None,
+        "save_total_limit": args.save_total_limit,
         "bf16": bf16,
         "fp16": not bf16,
         "gradient_checkpointing": True,

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +12,12 @@ from scripts.download_final_adapter import (
     load_manifest as load_adapter_manifest,
 )
 from scripts.download_final_adapter import verify_adapter_directory
+from scripts.validate_submission_artifacts import validate
+from scripts.verify_evaluation_package import (
+    sha256_file,
+    verify_static_contract,
+    verify_unlabeled_dataset,
+)
 
 
 MODEL_REPOSITORY = "Qwen/Qwen3.6-27B"
@@ -69,8 +77,6 @@ def build_command(args: argparse.Namespace) -> list[str]:
         "--metrics-output",
         str(output_dir / "metrics.json"),
     ]
-    if args.resume:
-        command.append("--resume")
     return command
 
 
@@ -100,18 +106,123 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-dir", type=Path, default=Path("outputs/final-inference")
     )
-    parser.add_argument("--resume", action="store_true")
     return parser
+
+
+def prepare_output_directory(path: Path) -> None:
+    if path.exists() and any(path.iterdir()):
+        raise RuntimeError(
+            "final output directory must be new or empty; stale rows are forbidden"
+        )
+    path.mkdir(parents=True, exist_ok=True)
+    lease = path / ".run-lease"
+    descriptor = os.open(lease, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(f"pid={os.getpid()}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def child_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    visible = environment.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        environment["CUDA_VISIBLE_DEVICES"] = "0"
+    else:
+        devices = [item.strip() for item in visible.split(",") if item.strip()]
+        if len(devices) != 1 or devices[0] in {"-1", "none", "None"}:
+            raise RuntimeError(
+                "final inference requires exactly one scheduler-visible CUDA device"
+            )
+    return environment
+
+
+def canonical_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def atomic_write_json(path: Path, payload: object) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    if os.name != "nt":
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
 
 def main() -> None:
     args = build_parser().parse_args()
+    static_contract = verify_static_contract(Path("."))
+    dataset_contract = verify_unlabeled_dataset(args.data_dir)
     manifest = load_adapter_manifest(args.adapter_manifest)
     verification = verify_adapter_directory(args.adapter_path, manifest)
-    if verification.get("checkpoint_step") != 2726:
-        raise RuntimeError("final adapter is not checkpoint-2726")
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run(build_command(args), check=True)
+    if (
+        verification.get("checkpoint_step") != 2726
+        or verification.get("adapter_sha256")
+        != static_contract["adapter_sha256"]
+        or manifest.get("manifest_sha256")
+        != static_contract["adapter_manifest_sha256"]
+    ):
+        raise RuntimeError("adapter does not match the frozen checkpoint-2726 contract")
+    prepare_output_directory(args.output_dir)
+    environment = child_environment()
+    command = build_command(args)
+    subprocess.run(command, check=True, env=environment)
+    artifact_validation = validate(
+        argparse.Namespace(
+            test_csv=args.data_dir / "test.csv",
+            submission=args.output_dir / "submission.csv",
+            audit=args.output_dir / "audit.jsonl",
+            expected_tta=4,
+            metrics=args.output_dir / "metrics.json",
+            aggregation_mode="hard",
+        )
+    )
+    post_dataset_contract = verify_unlabeled_dataset(args.data_dir)
+    if post_dataset_contract != dataset_contract:
+        raise RuntimeError("evaluation dataset changed during inference")
+    release_sources = {
+        relative: sha256_file(Path(relative))
+        for relative in (
+            "configs/final_inference.json",
+            "configs/weights/qwen36-27b-final.manifest.json",
+            "configs/weights/qwen36-checkpoint2726-adapter.manifest.json",
+            "scripts/run_final_inference.py",
+            "scripts/validate_submission_artifacts.py",
+            "scripts/verify_evaluation_package.py",
+            "src/snuaichal/inference.py",
+            "src/snuaichal/modeling.py",
+            "src/snuaichal/physical_memory.py",
+            "src/snuaichal/submission.py",
+            "src/snuaichal/tta.py",
+        )
+    }
+    execution_contract = {
+        "command": command,
+        "cuda_visible_devices": environment["CUDA_VISIBLE_DEVICES"],
+        "release_source_sha256": release_sources,
+    }
+    receipt = {
+        "schema_version": 1,
+        "status": "PASS",
+        "execution_contract": execution_contract,
+        "execution_contract_sha256": canonical_sha256(execution_contract),
+        "static_contract": static_contract,
+        "unlabeled_dataset": dataset_contract,
+        "adapter": verification,
+        "artifacts": artifact_validation,
+    }
+    atomic_write_json(args.output_dir / "reproduction-receipt.json", receipt)
 
 
 if __name__ == "__main__":

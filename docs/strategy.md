@@ -1,79 +1,87 @@
-# Competition strategy
+# Final competition strategy
 
-Last updated: 2026-07-15
+Last updated: 2026-07-24
 
-## Objective
+## Objective hierarchy
 
-Maximize exact-match accuracy for four-frame temporal ordering while remaining reproducible on one RTX 3090 24 GB and compliant with the single-model/no-external-data rules.
+1. Qualify for the final round using Public+Private performance and a complete report.
+2. Maximize final-round award probability through a defensible, efficient method.
+3. Preserve exact code/weight reproducibility for organizer reruns and the one-shot
+   external evaluation.
+4. Avoid leaderboard-only complexity that does not improve the frozen system.
 
-## Measured baseline
+## Frozen final system
 
-- Training rows: 9,535
-- Label space: all 24 permutations
-- Identity label `[1, 2, 3, 4]`: 1,478 rows (15.50%)
-- Kaggle identity submission: 0.15532 public accuracy
-- Mean sentence length: 24.15 whitespace-delimited words; maximum 69
-- Duplicate sentences: one duplicated pair only
-- Qwen2-VL-2B LoRA smoke test: batch sizes 1 and 2 both completed on RTX 3090
+- Base: `Qwen/Qwen3.6-27B`
+- Revision: `6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`
+- Training data: all 9,535 official labeled rows
+- Adapter: QLoRA checkpoint 2726, rank/alpha 32/32, dropout 0.05
+- Runtime: NF4/BF16, SDPA, 512² image-area budget, batch 1
+- TTA: `1234`, `2341`, `3412`, `4123`
+- Mapping: transform every view prediction back to original input-slot coordinates
+- Aggregation: hard majority, deterministic lexicographic exact-tie rule
+- Public score: 0.93542
+- Physical RTX 3090 peak: 22,710,861,824 bytes, approximately 21.15 GiB
 
-The identity public score closely matches its training prior. Input order therefore has a strong and transferable class bias. A useful model must beat this prior on a fixed validation split, not merely reduce language-model loss.
+The old 8B/Qwen3.5 plan was an exploration-stage strategy and is superseded by this
+document. Its useful role is limited to baseline and ablation evidence.
 
-## Primary approach
+## Why this candidate
 
-The reproduction target is the public 0.91972 result with one
-`Qwen/Qwen3-VL-8B-Instruct` checkpoint. Qwen3.5-27B is a secondary dense challenger,
-not an ensemble member.
+| Candidate | Public | Views | Decision |
+|---|---:|---:|---|
+| Q36-2726 Latin4 confidence | 0.92670 | 4 | confidence removed |
+| **Q36-2726 Latin4 hard** | **0.93542** | **4** | **frozen final** |
+| Q36-2726 TTA24 hard | 0.93193 | 24 | more compute, lower observed Public |
+| Q36-3400 TTA12 hard | 0.93542 | 12 | tied, three times the views |
+| Q35-1073 Latin4 confidence | 0.92844 | 4 | emergency baseline only |
 
-1. Split a deterministic, label-stratified, image-disjoint 10% holdout before any augmentation and save all split IDs.
-2. At each training epoch, deterministically shuffle each row's four input slots from `SHA-256(seed, epoch, Id)` and transform the answer. Never augment validation.
-3. Load the 8B model with bitsandbytes NF4 double quantization and BF16 compute. Freeze the vision tower and apply LoRA to language attention/MLP projections.
-4. Train with micro batch 1, accumulation 8, and a six-epoch cosine scheduler horizon. Stop and save after four epochs at global step 4292; do not shorten the scheduler with `max_steps`.
-5. Evaluate every epoch checkpoint by generated exact match, parse failure, 24-way confusion, speed, peak VRAM, and cyclic 4-TTA consistency.
-6. For TTA, canonicalize every permuted-view prediction back to original input-slot coordinates before voting. Use identity only when all four parses fail.
-7. Run Qwen3.5-27B only after an 8B two-step smoke and pipeline validation. Keep one final model/checkpoint.
+The 2726-vs-3400 comparison is an end-to-end candidate comparison, not a pure
+checkpoint causal ablation, because view count also changes. The selection rule is
+nevertheless clear: among tied observed Public candidates, keep the earlier
+checkpoint and lower inference cost.
 
-## Experiment order
+## Method contribution boundary
 
-| Stage | Change | Gate |
-|---|---|---|
-| A | Qwen3-VL-8B NF4 two-step smoke at 512² | No OOM; record visual tokens, trainable parameters, loss, LR, peak VRAM |
-| B | 8B LoRA, 10% clean split, no augmentation | Establish generated exact-match baseline |
-| C | Deterministic epoch-aware slot augmentation | Improve non-identity and overall exact match |
-| D | Evaluate checkpoints 1073/2146/3219/4292 with cyclic 4-TTA | Select by exact match, then failures/speed; no ensemble |
-| E | Qwen3.5-27B rank-8 NF4 smoke and one challenger run | Keep only if 24 GB feasible and validation improves |
-| F | Full test inference and Kaggle submission | Validate 819 rows, zero invalid answers, runtime under 24 hours |
+Qwen, QLoRA, index shuffling and TTA are established components. The team-specific
+contribution is their task-consistent integration:
 
-## Reproduction training configuration
+1. Treat input permutation as a coordinate transform, not an ordinary image
+   augmentation.
+2. Transform the training Answer with the same group action used for image slots.
+3. Invert each TTA prediction to original-slot coordinates before aggregation.
+4. Use a four-view cyclic design that balances the first-order
+   frame-by-displayed-position exposure.
+5. Remove confidence weighting after a direct calibration ablation.
+6. Bind the model tree, adapter, runtime contract and scored source to SHA-256
+   manifests and raw-output audits.
 
-- Model: `Qwen/Qwen3-VL-8B-Instruct`, revision `0c351dd01ed87e9c1b53cbc748cba10e6187ff3b`
-- Quantization: bitsandbytes NF4, double quantization, BF16 compute
-- LoRA: rank 16, alpha 32, dropout 0.05; language projections only; frozen vision tower
-- Image budget: 512×512 area (`262,144` pixels), while preserving aspect ratio
-- Micro batch: 1; gradient accumulation: 8 (effective batch 8)
-- Learning rate: 2e-4, 3% warmup, cosine horizon 6438 updates
-- Stop: callback at global step 4292; checkpoints every 1073 updates
-- Validation: deterministic label-stratified 10% clean holdout, never augmented
-- Generation: thinking disabled for Qwen3.5, strict final-answer parsing, max 16 new tokens
-- Selection metric: validation exact match, then parse-failure/TTA consistency/speed
-- Challenger: `Qwen/Qwen3.5-27B`, revision `fc05daec18b0a78c049392ed2e771dde82bdf654`, default LoRA rank 8
+Latin4 does not prove that every higher-order positional interaction or model bias is
+zero. It only removes the stated first-order exposure imbalance.
 
-## Risks and controls
+## Generalization policy
 
-- **Label-prior overfitting:** report identity and non-identity validation accuracy separately.
-- **Noisy/ambiguous samples:** start with one epoch; inspect high-loss and disagreement cases before filtering.
-- **Generation format errors:** parse strictly and report failures; fallback is identity because it is the measured majority prior.
-- **Validation leakage:** exact image reuse affects 46.3% of images, so select validation only from globally unique-image rows and split before augmentation.
-- **Checkpoint mismatch:** preserve all adapters and rank them with generated exact match; do not select by teacher-forcing loss.
-- **Prohibited test-set analysis:** do not inspect, hash-match, cluster, or otherwise use evaluation-set characteristics to design preprocessing or the model. The official rule explicitly forbids this; use test rows only through the fixed final inference path unless organizers grant written approval.
-- **Rule violation:** use one model/checkpoint only, no external or generated data, and record all parameters and runtime.
-- **Compute overrun:** smoke-test every configuration, record peak VRAM, and retain resumable checkpoints.
+Public uses only 70% of the test set and repeated candidate selection may overfit it.
+The final Q36 model also uses all labeled training rows, so it has no leakage-free
+same-model holdout. These limitations are reported rather than hidden.
 
-## Success criteria
+For the organizer external dataset:
 
-The implementation is ready for a competitive submission when:
+- use the exact frozen checkpoint-2726 release;
+- do not train, tune, select, rescale, ensemble or change the prompt;
+- reject an `Answer` column and unsafe/missing image paths before CUDA load;
+- run the fixed Latin4-hard wrapper once in a fresh output directory;
+- preserve `submission.csv`, raw audit, metrics and reproduction receipt;
+- do not alter the rule after observing any external score.
 
-- tests and lint pass;
-- a LoRA adapter can be trained, saved, reloaded, and used for inference;
-- validation reports exact match, identity accuracy, non-identity accuracy, and parse failures;
-- a full 819-row submission contains only valid permutations;
-- measured validation accuracy exceeds the 15.5% identity-prior baseline before using a Kaggle submission slot.
+## Final evidence
+
+- [Five-page report](final_report_5page_ko.pdf)
+- [Machine-readable results](final_results.json)
+- [Reviewer reproduction guide](reviewer_quickstart.md)
+- [Final inference contract](../configs/final_inference.json)
+- [Base manifest](../configs/weights/qwen36-27b-final.manifest.json)
+- [Adapter manifest](../configs/weights/qwen36-checkpoint2726-adapter.manifest.json)
+
+No external commercial API, external training dataset, pseudo-labeling or
+multi-model ensemble was used for model development.

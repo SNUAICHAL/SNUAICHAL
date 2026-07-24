@@ -1,47 +1,56 @@
-# 대회 규정 준수 체크리스트
+# 최종 코드·보고서 제출 체크리스트
 
-이 문서는 2026-07-13에 확인한 공식
-[Rules](https://snuaichallenge.github.io/rules/),
-[FAQ](https://snuaichallenge.github.io/faq/),
-[Agreement](https://snuaichallenge.github.io/agreement/)를 구현 단계에서 확인하기 위한
-요약입니다. 최종 판단은 Kaggle Discussion과 운영진의 최신 공지를 우선합니다.
+기준 공지: 2026-07-24 확인본. 보고서·코드 제출 마감은 2026-07-28,
+보고서는 PDF 최대 5페이지이며 Public 상위 30팀은 제출 필수입니다. 최종 판단은
+운영진 최신 공지를 우선합니다.
 
-## 모델·데이터
+## 완료된 release gate
 
-- [ ] Python으로만 학습 및 추론
-- [ ] 제공된 학습 데이터만 사용하고 외부 데이터는 사용하지 않음
-- [ ] 대회 데이터 원본·수정본을 저장소에 커밋하거나 제3자에게 재배포하지 않음
-- [ ] 제공 데이터 증강 시 생성형 모델을 이용한 데이터 생성·변형을 하지 않음
-- [ ] 평가 데이터 수작업 라벨링, 통계 분석, 전처리 반영 등 데이터 누수 없음
-- [ ] 공개 가중치는 2026-05-31 이전 공개된 모델만 사용
-- [ ] 단일 모델만 사용하며 모델/폴드/데이터 분할 결과를 앙상블하지 않음
-- [ ] Quantization 또는 LoRA 사용 시 설정과 결과를 기록
-- [ ] 테스트 전체 추론이 지정 서버에서 24시간 이내 완료
+- [x] 실행 가능한 학습·추론 Python source 포함
+- [x] Python 3.10 및 pinned library 환경 기록
+- [x] 설치, base/adapter 다운로드, inference, CSV audit 명령을 README에 기록
+- [x] Qwen3.6 base revision과 29-file/15-shard SHA-256 manifest 포함
+- [x] checkpoint-2726 adapter를 GitHub Release asset으로 제공
+- [x] adapter archive·내부 파일 SHA-256 검증 downloader 포함
+- [x] 최종 모델을 Q36-2726 rank32/alpha32 하나로 고정
+- [x] 최종 추론을 Latin4 hard-majority 하나로 고정
+- [x] 819행, 3,276 views, parse failure 0 기록
+- [x] RTX 3090 physical peak 약 21.15 GiB 기록
+- [x] generation 약 3 h 45 m, end-to-end 약 3 h 53 m 기록
+- [x] Public 0.93542 CSV SHA를 `docs/final_results.json`에 기록
+- [x] 외부 상용 API·외부 학습 데이터·pseudo-label·model ensemble 미사용 선언
+- [x] 대회 데이터와 test prediction 원문을 GitHub에 미포함
+- [x] 한국어 최종 보고서 PDF 정확히 5페이지
+- [x] report Markdown, machine-readable result, model license attribution 포함
+- [x] lightweight CI에서 Ruff, compile, full unit test 실행
+- [x] 외부 평가용 무라벨 data/path preflight와 semantic CSV auditor 포함
+- [x] 외부 평가 exactly-once frozen inference 절차 기록
 
-## 실행·제출
+## 운영진 외부 데이터 1회 평가
 
-- [ ] RTX 3090 24 GB 1장으로 실행 가능
-- [ ] 인터넷이 차단된 상태에서 로컬 가중치만으로 실행 가능
-- [ ] 상용 API를 학습 또는 추론 과정에 사용하지 않음
-- [ ] 상용 API 사용은 데이터 전처리 목적으로만 제한하고 총비용 30,000원 이하
-- [ ] 모든 입출력 경로가 저장소 기준 상대 경로
-- [ ] 코드와 주석이 UTF-8이며 `.py` 학습/추론 코드가 오류 없이 실행됨
-- [ ] `submission.csv`의 모든 `Answer`가 1~4의 정확한 순열
-- [ ] UTC 기준 하루 2회 제출 제한 준수
-- [ ] 코드와 가중치 전체 크기가 80 GB 이하
-- [ ] 저장소 공개와 코드·가중치 공유가 Agreement 및 제3자 라이선스를 준수함
+- [ ] frozen Git commit/tag와 adapter release SHA를 receipt에 기록
+- [ ] 별도 학습·tuning·model selection을 수행하지 않음
+- [ ] `Answer` 없는 공식 external `test.csv`를 새 `data/`에 배치
+- [ ] `scripts/verify_evaluation_package.py --require-all` PASS
+- [ ] 새 output directory에서 `scripts.run_final_inference` exactly once 실행
+- [ ] `reproduction-receipt.json`과 독립 CSV auditor PASS
+- [ ] 결과를 본 뒤 checkpoint/prompt/TTA/aggregation을 변경하지 않음
+- [ ] 운영진 Kaggle에 정확히 1회 제출하고 receipt 보존
 
-## 재현성·보고서
+## GitHub·Google Form 제출 전 사용자 확인
 
-- [ ] OS, CPU, GPU, 드라이버, CUDA, Python, 라이브러리 버전 기록
-- [ ] 랜덤 시드, 명령어, 실행 시간, 최대 VRAM, 결과 해시 기록
-- [ ] 최종 가중치와 추론 코드를 함께 보관
-- [ ] 상위 16위 진입 시 A4 5쪽 이내 Word 보고서 제출 준비
-- [ ] 전처리용 외부 API 사용 방식, 실험 결과, 비용을 발표 자료에 기록
-- [ ] 전처리용 외부 API 총비용이 30,000원 이하임을 영수증/대시보드로 증빙
+- [ ] GitHub 초대가 pending이 아니라 `SNUAIchallenge: read`로 수락됐는지 확인
+- [ ] Google Form에 대표자 정보, GitHub URL과 최종 PDF 업로드
+- [ ] Form에 제출한 Git commit/tag와 Release URL 별도 보존
+- [ ] private Release asset을 운영진 collaborator 계정이 다운로드 가능한지 확인
+- [ ] 제출 완료 화면 또는 이메일 receipt 보존
 
-## 발표
+## 심사 해석 주의
 
-- [ ] 발표 자료는 전날까지 PPT 또는 PDF로 제출
-- [ ] 본 발표 10분, 질의응답 5분에 맞춰 준비
-- [ ] 팀원 전원이 오프라인 공개 발표에 참석
+- Public 0.93542는 test 70% 관찰이며 Private/외부 점수 보장이 아닙니다.
+- final full-data QLoRA에는 leakage-free 동일-model holdout이 없습니다.
+- Latin4는 first-order frame-position exposure를 균형화하지만 모든 position bias를
+  제거했다고 주장하지 않습니다.
+- Q36-2726 Latin4와 Q36-3400 TTA12는 checkpoint와 view가 함께 다른 operational
+  후보 비교입니다.
+- 실제 RunPod 총 연구비는 billing receipt 없이 추정값을 확정 금액으로 쓰지 않습니다.

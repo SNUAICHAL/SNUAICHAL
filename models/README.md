@@ -1,28 +1,18 @@
-# Model weights
+# Final model weights
 
-모델 가중치는 Git에 올리지 않으며 학습/추론 코드도 자동 다운로드하지 않습니다.
-인터넷이 허용된 준비 환경에서 필요한 모델 하나만 immutable revision으로 받습니다.
+대회 데이터와 base weights는 Git에 커밋하지 않습니다. 최종 시스템은 아래 한
+snapshot과 한 adapter만 사용합니다.
 
-Qwen3-VL-8B-Instruct (Apache-2.0, 2025-10-11 공개, 약 17.55 GB):
+## Qwen3.6-27B base
 
-```bash
-hf download Qwen/Qwen3-VL-8B-Instruct \
-  --revision 0c351dd01ed87e9c1b53cbc748cba10e6187ff3b \
-  --local-dir models/Qwen3-VL-8B-Instruct
-```
+- Repository: `Qwen/Qwen3.6-27B`
+- Revision: `6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`
+- License: Apache-2.0; pinned snapshot의 `LICENSE` 확인
+- Inventory: 29 files, 15 safetensors shards, 55,586,107,940 bytes
+- Portable tree SHA-256:
+  `e4107e6508793261ca372faf4b560dcb55a5b6ba79a5ab921bfe1b25a207ec07`
 
-Qwen3.5-27B dense challenger (Apache-2.0, 2026-02-24 공개, 약 55.58 GB):
-
-```bash
-hf download Qwen/Qwen3.5-27B \
-  --revision fc05daec18b0a78c049392ed2e771dde82bdf654 \
-  --local-dir models/Qwen3.5-27B
-```
-
-Qwen3.5-27B는 8B pipeline과 2-step smoke가 검증된 뒤에만 받는 것을 권장합니다.
-4-bit loading은 메모리에서 quantize할 뿐 원본 snapshot 다운로드 크기를 줄이지 않습니다.
-
-최종 제출 Qwen3.6-27B (Apache-2.0, pinned revision):
+자동 다운로드와 byte verification:
 
 ```bash
 python -B scripts/download_weights.py \
@@ -30,37 +20,46 @@ python -B scripts/download_weights.py \
   --output models/Qwen3.6-27B
 ```
 
-이 경로는 29개 파일과 15개 safetensors shard의 크기·SHA-256을 검증합니다.
-최종 checkpoint-2726 adapter는 다음 명령으로 별도 설치합니다.
+이미 받은 snapshot의 오프라인 검증:
+
+```bash
+python -B scripts/download_weights.py \
+  --manifest configs/weights/qwen36-27b-final.manifest.json \
+  --output models/Qwen3.6-27B \
+  --verify-only
+```
+
+## checkpoint-2726 QLoRA adapter
+
+- rank/alpha: 32/32
+- adapter SHA-256:
+  `189f6c1be09bce1a9b71afeb4807b255b4c144fd2ddfc495ba0109d08ca9f1f6`
+- Release archive SHA-256:
+  `f89df01d00d3b4808881abd2abb2d48df35213c1b1506dd856ac66c62cd5a054`
 
 ```bash
 python -B scripts/download_final_adapter.py \
   --output weights/qwen36-checkpoint2726
 ```
 
-스냅샷 구조 예시:
+private repository에서는 `gh auth login` 또는 read 권한이 있는
+`GH_TOKEN`/`GITHUB_TOKEN`이 필요합니다.
 
-```text
-models/Qwen3-VL-8B-Instruct/
-├── config.json
-├── generation_config.json
-├── preprocessor_config.json
-├── tokenizer_config.json
-├── model-*.safetensors
-└── ...
-```
+## 검증 원칙
 
-오프라인 검증:
+- manifest revision을 branch name이나 `main`으로 바꾸지 않습니다.
+- adapter merge/dequantization을 하지 않습니다.
+- inference는 기본적으로 network-disabled local snapshot을 사용합니다.
+- 운영진 외부 평가 전 아래처럼 base, adapter, source와 무라벨 data 계약을 함께
+  확인합니다.
 
 ```bash
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
-snu-infer --model-path models/Qwen3-VL-8B-Instruct --limit 1
+python -B -m scripts.verify_evaluation_package \
+  --data-dir data \
+  --model-path models/Qwen3.6-27B \
+  --adapter-path weights/qwen36-checkpoint2726 \
+  --require-all
 ```
 
-추론기는 기본적으로 `local_files_only=True`로 로드합니다. 제출 전 다음을 확인하세요.
-
-- 가중치 공개일이 대회 기준일(2026-05-31) 이전인지 근거 링크와 함께 기록
-- 모델 라이선스 및 재배포 조건 확인
-- 코드와 가중치를 합친 전체 크기가 80 GB 이하인지 확인
-- 깨끗한 오프라인 환경에서 실제 로딩 및 전체 추론 완료 확인
+과거 Qwen3-VL-8B와 Qwen3.5-27B는 baseline/ablation이며 최종 외부 평가에
+사용하지 않습니다. license attribution은 `docs/model_licenses.md`에 있습니다.

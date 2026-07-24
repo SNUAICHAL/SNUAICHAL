@@ -16,7 +16,12 @@ from scripts.download_final_adapter import (
     download_archive,
     load_manifest,
 )
-from scripts.run_final_inference import LATIN4, build_command
+from scripts.run_final_inference import (
+    LATIN4,
+    build_command,
+    child_environment,
+    prepare_output_directory,
+)
 
 
 def _record(path: str, content: bytes) -> dict[str, object]:
@@ -129,7 +134,6 @@ def test_final_inference_command_is_frozen_to_latin4_hard(tmp_path: Path) -> Non
         model_manifest=Path("configs/weights/qwen36-27b-final.manifest.json"),
         adapter_path=Path("weights/qwen36-checkpoint2726"),
         output_dir=tmp_path,
-        resume=True,
     )
 
     command = build_command(args)
@@ -138,4 +142,30 @@ def test_final_inference_command_is_frozen_to_latin4_hard(tmp_path: Path) -> Non
     assert command[command.index("--tta") + 1] == "4"
     assert json.loads(command[command.index("--tta-orders-json") + 1]) == LATIN4
     assert command[command.index("--max-new-tokens") + 1] == "64"
-    assert command[-1] == "--resume"
+    assert "--resume" not in command
+
+
+def test_final_output_directory_must_be_fresh(tmp_path: Path) -> None:
+    output = tmp_path / "final"
+    prepare_output_directory(output)
+    assert output.is_dir()
+
+    (output / "stale-row.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="new or empty"):
+        prepare_output_directory(output)
+
+
+def test_final_inference_respects_single_scheduler_visible_device(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-assigned-by-slurm")
+    assert child_environment()["CUDA_VISIBLE_DEVICES"] == "GPU-assigned-by-slurm"
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    with pytest.raises(RuntimeError, match="exactly one"):
+        child_environment()
+
+
+def test_final_inference_defaults_to_first_device_when_unset(monkeypatch) -> None:
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    assert child_environment()["CUDA_VISIBLE_DEVICES"] == "0"

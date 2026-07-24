@@ -1,5 +1,8 @@
 # SNU AI Challenge 2026 final solution
 
+[![CI](https://github.com/SNUAICHAL/SNUAICHAL/actions/workflows/ci.yml/badge.svg)](https://github.com/SNUAICHAL/SNUAICHAL/actions/workflows/ci.yml)
+[![Final adapter](https://img.shields.io/badge/release-final--q36--2726--v1-0e5672)](https://github.com/SNUAICHAL/SNUAICHAL/releases/tag/final-q36-2726-v1)
+
 문장과 뒤섞인 네 장의 프레임으로 원래 시간 순서를 복원하는 SNU AI Challenge
 2026 제출 시스템입니다. 최종 재현 대상은 **Qwen3.6-27B + checkpoint-2726
 QLoRA + canonical Latin4 hard vote**입니다.
@@ -14,6 +17,14 @@ QLoRA + canonical Latin4 hard vote**입니다.
 
 최종 보고서는 [한국어 PDF](docs/final_report_5page_ko.pdf)와
 [원문 Markdown](docs/final_report_5page_ko.md)으로 제공합니다.
+
+심사위원·운영진은 [재현·평가 가이드](docs/reviewer_quickstart.md)에서 정적 계약
+검증, 가중치 준비, 무라벨 외부 데이터 preflight, 공식 단일-run 추론과 결과 감사를
+순서대로 실행할 수 있습니다. GPU나 데이터를 쓰기 전 최종 계약만 확인하려면:
+
+```bash
+python -B -m scripts.verify_evaluation_package
+```
 
 ## 최종 결과와 선택
 
@@ -105,7 +116,9 @@ data/
 ```
 
 `test.csv`는 `Id, Input_1, Input_2, Input_3, Input_4, Sentence` 열을 가져야
-합니다. 외부 데이터나 외부 상용 API를 학습·전처리·추론에 사용하지 않았습니다.
+합니다. 모델 개발·학습·선택·튜닝에는 외부 데이터나 외부 상용 API를 사용하지
+않았습니다. 운영진이 별도로 제공하는 외부 평가 데이터는 weights/code freeze 뒤
+운영진 평가용 단일 accepted inference에만 사용합니다.
 
 ## 가중치 준비
 
@@ -155,7 +168,9 @@ https://github.com/SNUAICHAL/SNUAICHAL/releases/download/final-q36-2726-v1/q36-c
 다른 CUDA workload가 없는지 확인한 뒤 실행합니다.
 
 ```bash
-python -B -m scripts.run_final_inference --data-dir data --resume
+python -B -m scripts.run_final_inference \
+  --data-dir data \
+  --output-dir outputs/final-inference
 ```
 
 기본 출력:
@@ -164,12 +179,20 @@ python -B -m scripts.run_final_inference --data-dir data --resume
 outputs/final-inference/
 ├── submission.csv
 ├── audit.jsonl
-└── metrics.json
+├── metrics.json
+└── reproduction-receipt.json
 ```
 
-`--resume`은 완전한 row audit만 재사용합니다. 최종 제출 전에는 다음을 확인합니다.
+공식 wrapper는 서로 다른 model/adapter/prompt/TTA의 과거 row가 섞이지 않도록
+resume을 허용하지 않습니다. `Answer` 열, 중복 ID, 경로 이탈과 symlink도 CUDA
+load 전에 거부하며, 종료 후 CSV와 raw audit를 다시 검산합니다. 전체 preflight와
+독립 artifact 검증 명령은
+[심사위원용 가이드](docs/reviewer_quickstart.md)에 있습니다.
+
+개발 의존성과 테스트를 설치한 뒤 다음을 확인합니다.
 
 ```bash
+python -m pip install -r requirements-dev.txt
 python -m pytest
 python -m ruff check src scripts tests
 ```
@@ -177,9 +200,14 @@ python -m ruff check src scripts tests
 실측 checkpoint-2726 Latin4 run은 RTX 3090에서 다음과 같았습니다.
 
 - 819/819 rows, parse failure 0
-- 16.4693 seconds/row, 약 3시간 45분
+- generation loop 16.4693 seconds/row, 819행 환산 약 3시간 45분
+- model load·검증·종료를 포함한 end-to-end 13,990.456초, 약 3시간 53분
 - physical peak VRAM 22,710,861,824 bytes(약 21.15 GiB)
 - Public score 0.93542
+
+최종 release source로 다시 수행한 fresh one-row model-load/generation/auditor smoke도
+PASS했습니다. 무라벨 입력과 예측을 재배포하지 않은 sanitized receipt는
+[docs/cleanroom_smoke_receipt.json](docs/cleanroom_smoke_receipt.json)에 있습니다.
 
 ## 방법 개요
 
@@ -192,20 +220,25 @@ test-time canonicalization과 학습 표현을 맞추는 것이 목적입니다.
 ### Canonical Latin4
 
 네 cyclic permutation은 각 원본 이미지가 네 displayed position에 정확히 한 번씩
-나타나는 Latin square입니다. 각 view의 예측은 먼저 원래 slot 좌표로 역변환한 뒤
-vote합니다. 이 단계를 생략하면 서로 다른 좌표계의 답을 집계하게 됩니다.
+나타나는 Latin square입니다. 따라서 frame-position의 1차 주변 노출 불균형을
+제거합니다. 이는 모든 고차 순서 상호작용이나 model bias가 0이라는 뜻은 아닙니다.
+각 view의 예측은 먼저 원래 slot 좌표로 역변환한 뒤 vote합니다. 이 단계를 생략하면
+서로 다른 좌표계의 답을 집계하게 됩니다.
 
 ### 적은 view를 선택한 이유
 
-24-view는 더 많은 계산으로 permutation coverage를 늘리지만, 이미 균형인 Latin4
-이후에는 편향 감소보다 noisy view의 추가가 커질 수 있습니다. 실제로 동일
-checkpoint-2726에서 TTA24 hard는 0.93193으로 Latin4 hard 0.93542보다 낮았습니다.
-confidence tie-break도 0.92670으로 하락해 최종 시스템에서는 제거했습니다.
+24-view는 permutation coverage를 늘리지만 계산량도 6배입니다. 동일
+checkpoint-2726에서 추가 views는 16행의 최종 결정을 바꿨고, 관측 Public은
+TTA24 hard 0.93193으로 Latin4 hard 0.93542보다 낮았습니다. confidence
+tie-break도 0.92670으로 하락해 최종 시스템에서는 제거했습니다. 이 관찰은 Public
+70%에서의 operational comparison이며 추가 view가 일반적으로 해롭다는 인과
+주장은 아닙니다.
 
 ### 재현성과 자원 효율
 
-base model, adapter, command, raw output과 physical-memory evidence를 SHA-256
-receipt로 묶었습니다. adapter merge와 multi-model ensemble은 쓰지 않았고,
+base model, adapter, exact child command, release source, 입력 CSV·image tree,
+raw-output audit, CSV와 physical-memory evidence를 SHA-256 receipt로
+묶었습니다. adapter merge와 multi-model ensemble은 쓰지 않았고,
 단일 resident model과 batch 1로 24 GB 제약을 만족했습니다.
 
 ## 학습 재현
@@ -223,12 +256,17 @@ snu-train \
   --model-manifest configs/weights/qwen36-27b-final.manifest.json \
   --load-in-4bit \
   --validation-fraction 0 \
-  --epochs 6 \
+  --epochs 3 \
   --image-size 512 \
   --batch-size 1 \
   --gradient-accumulation-steps 8 \
+  --learning-rate 1e-4 \
   --lora-rank 32 \
   --lora-alpha 32 \
+  --lora-dropout 0.05 \
+  --save-steps 537 \
+  --save-total-limit 2 \
+  --logging-steps 1 \
   --seed 42 \
   --stop-after-steps 2726 \
   --output-dir outputs/q36-r32-full2726
@@ -247,10 +285,12 @@ configs/
     └── qwen36-checkpoint2726-adapter.manifest.json
 docs/
 ├── final_report_5page_ko.pdf
+├── reviewer_quickstart.md
 └── model_licenses.md
 scripts/
 ├── download_weights.py
 ├── download_final_adapter.py
+├── verify_evaluation_package.py
 └── run_final_inference.py
 src/snuaichal/
 ├── inference.py
