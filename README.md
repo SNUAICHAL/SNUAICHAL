@@ -16,7 +16,7 @@ QLoRA + canonical Latin4 hard vote**입니다.
 - 819행 제출 CSV, raw-output audit, metrics receipt 생성
 
 최종 보고서는 [한국어 PDF](docs/final_report_5page_ko.pdf)와
-[LaTeX 원문](report/main.tex)으로 제공합니다.
+[원문 Markdown](docs/final_report_5page_ko.md)으로 제공합니다.
 
 심사위원·운영진은 [재현·평가 가이드](docs/reviewer_quickstart.md)에서 정적 계약
 검증, 가중치 준비, 무라벨 외부 데이터 preflight, 공식 단일-run 추론과 결과 감사를
@@ -197,15 +197,6 @@ python -m pytest
 python -m ruff check src scripts tests
 ```
 
-최종 보고서는 Tectonic과 Poppler로 재현할 수 있습니다. 빌드는 A4 정확히 5쪽과
-layout overflow를 검사한 뒤 추적 중인 PDF를 교체합니다.
-
-```bash
-python -B scripts/build_report.py \
-  --tectonic /path/to/tectonic \
-  --pdfinfo /path/to/pdfinfo
-```
-
 실측 checkpoint-2726 Latin4 run은 RTX 3090에서 다음과 같았습니다.
 
 - 819/819 rows, parse failure 0
@@ -296,11 +287,7 @@ docs/
 ├── final_report_5page_ko.pdf
 ├── reviewer_quickstart.md
 └── model_licenses.md
-report/
-├── main.tex
-└── README.md
 scripts/
-├── build_report.py
 ├── download_weights.py
 ├── download_final_adapter.py
 ├── verify_evaluation_package.py

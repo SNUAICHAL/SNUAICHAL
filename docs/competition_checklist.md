@@ -21,7 +21,7 @@
 - [x] 외부 상용 API·외부 학습 데이터·pseudo-label·model ensemble 미사용 선언
 - [x] 대회 데이터와 test prediction 원문을 GitHub에 미포함
 - [x] 한국어 최종 보고서 PDF 정확히 5페이지
-- [x] LaTeX report source, machine-readable result, model license attribution 포함
+- [x] report Markdown, machine-readable result, model license attribution 포함
 - [x] lightweight CI에서 Ruff, compile, full unit test 실행
 - [x] 외부 평가용 무라벨 data/path preflight와 semantic CSV auditor 포함
 - [x] 외부 평가 exactly-once frozen inference 절차 기록
